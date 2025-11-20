@@ -16,7 +16,7 @@ do.FFTPlot        = 0;
 do.SpectroPlot    = 0;
 do.CloudPlot      = 0;
 
-material = 1;  % 0: synthetic data, 1: UM1, 2: UM2, 3: UM3, 4: UT1, 5: UT2, 6: Ag2.5, 7: Ag0.5, 8: PA1.7, 9: PEGDA
+material = 0;  % 0: synthetic data, 1: UM1, 2: UM2, 3: UM3, 4: UT1, 5: UT2, 6: Ag2.5, 7: Ag0.5, 8: PA1.7, 9: PEGDA
 
 % -------------------- Load R_d, t_d (DIMENSIONAL) --------------------
 % Result after this block:
