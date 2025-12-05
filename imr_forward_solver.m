@@ -26,9 +26,9 @@ function sim = imr_forward_solver(theta, modelName, expData, solverOpts)
 
     % ---------- Solver configuration (defaults match your wrapper) ----------
     if ~isfield(solverOpts,'radial'),    solverOpts.radial    = 2;   end
-    if ~isfield(solverOpts,'bubtherm'),  solverOpts.bubtherm  = 0;   end
+    if ~isfield(solverOpts,'bubtherm'),  solverOpts.bubtherm  = 1;   end
     if ~isfield(solverOpts,'medtherm'),  solverOpts.medtherm  = 0;   end
-    if ~isfield(solverOpts,'masstrans'), solverOpts.masstrans = 0;   end
+    if ~isfield(solverOpts,'masstrans'), solverOpts.masstrans = 1;   end
     if ~isfield(solverOpts,'vapor'),     solverOpts.vapor     = 1;   end
     if ~isfield(solverOpts,'Nt'),        solverOpts.Nt        = 100; end
     if ~isfield(solverOpts,'Mt'),        solverOpts.Mt        = 100; end

@@ -25,6 +25,7 @@ function results = bayesian_model_selection_gpr(expData, priors, models, opts)
     if ~isfield(opts,'betaGrid'),  opts.betaGrid  = 0.05:0.05:10; end
     if ~isfield(opts,'verbose'),   opts.verbose   = true;         end
     if ~isfield(opts,'gprOpts'),   opts.gprOpts   = struct();     end
+    if ~isfield(opts,'parallel'),  opts.parallel  = false;        end
     
     % Ensure GPR opts include betaGrid for consistency
     if ~isfield(opts.gprOpts,'betaGrid')
@@ -39,53 +40,28 @@ function results = bayesian_model_selection_gpr(expData, priors, models, opts)
     if opts.verbose
         fprintf('\n========================================\n');
         fprintf('  Bayesian Model Selection (GPR-based)\n');
+        if opts.parallel
+            fprintf('  Using PARALLEL processing\n');
+        else
+            fprintf('  Using SERIAL processing\n');
+        end
         fprintf('========================================\n');
         fprintf('Models: %s\n', strjoin(models, ', '));
         fprintf('Effective N: %d\n', priors.N_eff);
     end
     
     % ========== For each model, compute evidence via GPR integration ==========
-    for i = 1:NM
-        modelName = models{i};
-        
-        if opts.verbose
-            fprintf('\n--- Model %d/%d: %s ---\n', i, NM, upper(modelName));
+    if opts.parallel
+        % PARALLEL EXECUTION
+        parfor i = 1:NM
+            [log_evidence(i), theta_MAP{i}, gpr_out{i}] = ...
+                process_model(models{i}, i, NM, expData, priors, opts);
         end
-        
-        % Get parameter bounds
-        [xmin, xmax] = get_param_bounds(modelName, priors);
-        
-        % Define NLL function (negative log posterior without model prior)
-        % This is: -log p(data|θ,M) - log p(θ|M)
-        % Uses YOUR existing wrapper function
-        likeOpts.useRdot = true;
-        likeOpts.betaGrid = opts.betaGrid;
-        funNLL = @(X) imr_nll_with_prior_matrix(X, modelName, expData, priors, likeOpts);
-        
-        % Run GPR-based integration using YOUR existing active_integrate_logaware
-        tic;
-        gpr_result = active_integrate_logaware(funNLL, xmin, xmax, opts.gprOpts);
-        elapsed = toc;
-        
-        % Store full GPR output
-        gpr_out{i} = gpr_result;
-        
-        % Extract log evidence: log p(data|M) = log ∫ p(data|θ,M) p(θ|M) dθ
-        log_evidence(i) = gpr_result.logI_mean;
-        
-        % Find MAP parameters
-        [~, iMAP] = max(gpr_result.Y);  % Y is shifted log-likelihood
-        theta_MAP{i} = gpr_result.fromFeat(gpr_result.U(iMAP,:));
-        
-        if opts.verbose
-            fprintf('log10(evidence) = %.6g [%.6g, %.6g]\n', ...
-                    gpr_result.log10I_mean, ...
-                    gpr_result.log10I_CI95(1), gpr_result.log10I_CI95(2));
-            fprintf('MAP parameters: ');
-            fprintf('%.4g ', theta_MAP{i});
-            fprintf('\n');
-            fprintf('Computation time: %.2f sec\n', elapsed);
-            fprintf('GP evaluations: %d\n', size(gpr_result.U,1));
+    else
+        % SERIAL EXECUTION
+        for i = 1:NM
+            [log_evidence(i), theta_MAP{i}, gpr_out{i}] = ...
+                process_model(models{i}, i, NM, expData, priors, opts);
         end
     end
     
@@ -128,6 +104,25 @@ function results = bayesian_model_selection_gpr(expData, priors, models, opts)
         fprintf('MAP parameters: ');
         fprintf('%.4g ', theta_MAP{iBest});
         fprintf('\n');
+        
+        % Performance statistics
+        fprintf('\n========================================\n');
+        fprintf('  Performance Statistics\n');
+        fprintf('========================================\n');
+        fprintf('Model     Time(sec)  Evals  Evals/sec\n');
+        fprintf('----------------------------------------\n');
+        for i = 1:NM
+            n_evals = gpr_out{i}.n_evaluations;
+            comp_time = gpr_out{i}.computation_time;
+            evals_per_sec = n_evals / comp_time;
+            fprintf('%-6s    %8.1f  %5d    %6.2f\n', ...
+                    upper(models{i}), comp_time, n_evals, evals_per_sec);
+        end
+        fprintf('----------------------------------------\n');
+        total_time = sum(cellfun(@(x) x.computation_time, gpr_out));
+        total_evals = sum(cellfun(@(x) x.n_evaluations, gpr_out));
+        fprintf('TOTAL     %8.1f  %5d    %6.2f\n', ...
+                total_time, total_evals, total_evals/total_time);
     end
     
     % ========== Pack results ==========
@@ -144,6 +139,14 @@ function results = bayesian_model_selection_gpr(expData, priors, models, opts)
     % Identify most plausible model
     [results.max_posterior, results.best_idx] = max(model_posterior);
     results.best_model = models{results.best_idx};
+    
+    % Performance statistics (for each model)
+    results.performance = struct();
+    results.performance.model_times = cellfun(@(x) x.computation_time, gpr_out);
+    results.performance.model_evals = cellfun(@(x) x.n_evaluations, gpr_out);
+    results.performance.total_time = sum(results.performance.model_times);
+    results.performance.total_evals = sum(results.performance.model_evals);
+    results.performance.evals_per_sec = results.performance.model_evals ./ results.performance.model_times;
 end
 
 % ========== HELPER FUNCTION ==========
@@ -183,5 +186,51 @@ function [xmin, xmax] = get_param_bounds(modelName, priors)
             
         otherwise
             error('Unknown model: %s', modelName);
+    end
+end
+
+
+function [log_ev, map_theta, gpr_result] = process_model(modelName, idx, total, expData, priors, opts)
+    % PROCESS_MODEL - Process a single model for Bayesian selection
+    %   Helper function to enable parallel execution
+    
+    if opts.verbose
+        fprintf('\n--- Model %d/%d: %s ---\n', idx, total, upper(modelName));
+    end
+    
+    % Get parameter bounds
+    [xmin, xmax] = get_param_bounds(modelName, priors);
+    
+    % Define NLL function (negative log posterior without model prior)
+    likeOpts.useRdot = true;
+    likeOpts.betaGrid = opts.betaGrid;
+    funNLL = @(X) imr_nll_with_prior_matrix(X, modelName, expData, priors, likeOpts);
+    
+    % Run GPR-based integration
+    tic;
+    gpr_result = active_integrate_logaware(funNLL, xmin, xmax, opts.gprOpts);
+    elapsed = toc;
+    
+    % Extract results
+    log_ev = gpr_result.logI_mean;
+    
+    % Find MAP parameters
+    [~, iMAP] = max(gpr_result.Y);
+    map_theta = gpr_result.fromFeat(gpr_result.U(iMAP,:));
+    
+    % Add timing and evaluation count to gpr_result for tracking
+    gpr_result.model_name = modelName;
+    gpr_result.computation_time = elapsed;
+    gpr_result.n_evaluations = size(gpr_result.U, 1);
+    
+    if opts.verbose
+        fprintf('log10(evidence) = %.6g [%.6g, %.6g]\n', ...
+                gpr_result.log10I_mean, ...
+                gpr_result.log10I_CI95(1), gpr_result.log10I_CI95(2));
+        fprintf('MAP parameters: ');
+        fprintf('%.4g ', map_theta);
+        fprintf('\n');
+        fprintf('Computation time: %.2f sec\n', elapsed);
+        fprintf('GP evaluations: %d\n', gpr_result.n_evaluations);
     end
 end
