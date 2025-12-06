@@ -2,9 +2,6 @@
 % Run Bayesian model selection for IMR analysis
 clear; clc; close all;
 
-%% ========== REPRODUCIBILITY ==========
-rng(42, 'twister');  % Set random seed for reproducibility
-
 %% ========== CONFIGURATION ==========
 material_id = 0;        % 0=synthetic, 1-9=experimental
 use_parallel = false;   % Use parallel processing
@@ -18,8 +15,8 @@ models = {'newt', 'nh', 'kv', 'qnh', 'lm', 'qkv', 'sls'};
 
 % GPR options
 gprOpts = struct();
-gprOpts.maxRounds = 50;
-gprOpts.maxAddedMult = 150;
+gprOpts.maxRounds = 25;
+gprOpts.maxAddedMult = 120;
 gprOpts.tolRelCI = 0.05;
 gprOpts.betaGrid = 0.05:0.05:10;
 

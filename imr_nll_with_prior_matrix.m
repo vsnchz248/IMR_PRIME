@@ -15,7 +15,7 @@ function NLL = imr_nll_with_prior_matrix(X, modelName, expData, priors, likeOpts
     N = size(X, 1);
     NLL = zeros(N, 1);
     
-    for i = 1:N
+    parfor i = 1:N
         theta_i = X(i,:);
         
         % ========== 1. Forward simulation ==========

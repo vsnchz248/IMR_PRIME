@@ -52,7 +52,7 @@ function results = bayesian_model_selection_gpr(expData, priors, models, opts)
     
     % ========== For each model, compute evidence via GPR integration ==========
     if opts.parallel
-        % PARALLEL EXECUTION
+        % PARALLEL EXECUTION (simple parfor over models)
         parfor i = 1:NM
             [log_evidence(i), theta_MAP{i}, gpr_out{i}] = ...
                 process_model(models{i}, i, NM, expData, priors, opts);
