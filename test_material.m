@@ -35,7 +35,7 @@ gprOpts.betaGrid = 0.05:0.05:10;
 
 % ========== RUN ANALYSIS ==========
 
-Create output directory
+% Create output directory
 if save_figures || save_results
     if ~exist(output_dir, 'dir')
         mkdir(output_dir);
@@ -45,7 +45,7 @@ end
 % Print header
 fprintf('\n');
 fprintf('╔════════════════════════════════════════════════════╗\n');
-fprintf('║   BAYESIAN MODEL SELECTION - MATERIAL %d          ║\n', material_id);
+fprintf('║   BAYESIAN MODEL SELECTION - MATERIAL %d           ║\n', material_id);
 fprintf('╚════════════════════════════════════════════════════╝\n');
 fprintf('\n');
 fprintf('Configuration:\n');
