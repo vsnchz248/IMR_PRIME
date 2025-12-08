@@ -534,13 +534,12 @@ function d = row_dist(u, U)
     d  = sqrt(sum(du.^2, 2));
 end
 
-function [logI_bar, se_rqmc, sd_model_bar] = rqmc_integral_mean_and_SE(gpr, N, R, jacobian_fn, d)
-% RQMC_INTEGRAL_MEAN_AND_SE - Returns uncertainties in log-space (additive)
+function [logI_bar, se_rqmc, I_sd_model_bar] = rqmc_integral_mean_and_SE(gpr, N, R, jacobian_fn, d)
+% RQMC_INTEGRAL_MEAN_AND_SE - Correctly computes relative uncertainties
 
     logIvals = zeros(R,1); 
-    sd_model_per_scramble = zeros(R,1);
+    Isd_abs = zeros(R,1);  % Store absolute sigma, not sigma^2
     sob = scramble(sobolset(d),'MatousekAffineOwen');
-    ln10 = log(10);
     
     for r = 1:R
         U0 = net(sob, N);
@@ -548,55 +547,37 @@ function [logI_bar, se_rqmc, sd_model_bar] = rqmc_integral_mean_and_SE(gpr, N, R
         U = mod(U0 + shift, 1);
         w = jacobian_fn(U) / N;
         [mu, sd] = predict(gpr, U);
-        
-        % Compute log-integral
-        mu_e = ln10 * mu;
-        sd_e = ln10 * sd;
-        
-        % Log-integral (mean)
-        log_w = log(w);
-        log_integrand = log_w + mu_e + 0.5*sd_e.^2;
-        max_log = max(log_integrand);
-        logI_r = max_log + log(sum(exp(log_integrand - max_log)));
+        [logI_r, I_sd_r] = int_stats_log10(mu, sd, w);
         logIvals(r) = logI_r;
-        
-        % Model uncertainty: propagate GP variance through integral
-        % For small CV: Var(log I) H (sigma_I / I)^2 = CV^2
-        % Compute CV from GP variance
-        Lmean = exp(mu_e + 0.5*sd_e.^2);
-        Lvar = exp(2*mu_e + sd_e.^2) .* (exp(sd_e.^2) - 1);
-        I_mean_r = sum(w .* Lmean);
-        I_var_r = sum((w.^2) .* Lvar);
-        
-        % CV = sqrt(Var) / mean; for log: sd(log I) H CV
-        if I_mean_r > 0 && I_var_r > 0
-            CV_r = sqrt(I_var_r) / I_mean_r;
-            sd_model_per_scramble(r) = CV_r;
-        else
-            sd_model_per_scramble(r) = 0;
-        end
+        Isd_abs(r) = I_sd_r;  % Store sigma, not sigma^2
     end
     
-    % Average in log-space
+    % Average in log-space using logsumexp
     max_logI = max(logIvals);
     if ~isfinite(max_logI)
         logI_bar = -inf;
         se_rqmc = NaN;
-        sd_model_bar = NaN;
+        I_sd_model_bar = NaN;
         return;
+    else
+        logI_bar = max_logI + log(mean(exp(logIvals - max_logI)));
     end
     
-    logI_bar = max_logI + log(mean(exp(logIvals - max_logI)));
+    % Convert to linear space for relative errors
+    Ivals_linear = exp(logIvals);
+    Imean_linear = mean(Ivals_linear);
     
-    % RQMC uncertainty (already in log-space units = CV)
-    se_rqmc = std(logIvals, 0) / sqrt(R);
-    
-    % Model uncertainty (average CV across scrambles)
-    sd_model_bar = mean(sd_model_per_scramble);
-    
-    if ~isfinite(sd_model_bar)
-        sd_model_bar = 0;
+    % RQMC SE: relative (dimensionless)
+    se_abs = std(Ivals_linear, 0) / sqrt(R);
+    if Imean_linear > 0
+        se_rqmc = se_abs / Imean_linear;    % relative SE on I_rel
+    else
+        se_rqmc = NaN;
     end
+    
+    % Model (GP) contribution: CORRECTED - average relative sigmas properly
+    I_sd_rel = Isd_abs ./ max(Ivals_linear, realmin);  % per-scramble relative sigma
+    I_sd_model_bar = mean(I_sd_rel);  % CHANGED: simple mean, not RMS
 end
 
 % -------- log-aware maps --------

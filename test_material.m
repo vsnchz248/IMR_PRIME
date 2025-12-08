@@ -14,11 +14,11 @@ save_results = true;    % Save results
 output_dir = './results';
 
 % Models to test
-models = {'newt', 'nh', 'kv', 'qnh', 'lm', 'qkv', 'sls'};
+models = {'newt'};%, 'nh', 'kv', 'qnh', 'lm', 'qkv', 'sls'};
 
 % GPR options
 gprOpts = struct();
-gprOpts.maxRounds = 50;
+gprOpts.maxRounds = 30;
 gprOpts.maxAddedMult = 150;
 gprOpts.tolRelCI = 0.05;
 gprOpts.betaGrid = 0.05:0.05:10;
