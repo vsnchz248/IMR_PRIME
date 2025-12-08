@@ -18,7 +18,7 @@ models = {'newt'};%, 'nh', 'kv', 'qnh', 'lm', 'qkv', 'sls'};
 
 % GPR options
 gprOpts = struct();
-gprOpts.maxRounds = 30;
+gprOpts.maxRounds = 50;
 gprOpts.maxAddedMult = 150;
 gprOpts.tolRelCI = 0.05;
 gprOpts.betaGrid = 0.05:0.05:10;

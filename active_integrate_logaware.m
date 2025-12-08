@@ -106,10 +106,10 @@ function out = active_integrate_logaware(funNLL, xmin, xmax, opts)
 
     % Small RQMC for stop rule
     if d==1
-        N_rqmc_small = 2^15; R_rqmc_small = 8;
+        N_rqmc_small = 2^15; R_rqmc_small = 16;
     else
         N_rqmc_small = max(8192 * 2^(d-1), floor(Nacq/2));
-        R_rqmc_small = 6;
+        R_rqmc_small = 12;
     end
 
     % ----------------- Initial design (Sobol in U) -----------------
@@ -299,16 +299,12 @@ function out = active_integrate_logaware(funNLL, xmin, xmax, opts)
         [logIbar_small_rel, se_rqmc_small, Isd_model_small] = ...
             rqmc_integral_mean_and_SE(gpr, N_rqmc_small, R_rqmc_small, jacobian, d);
         
-        % CORRECTED: Total relative uncertainty (coefficient of variation)
-        % CV = sqrt(var_model + var_rqmc) = sqrt(sd_model^2 + se_rqmc^2)
+       % Convergence based on RQMC uncertainty
         CV_total = sqrt(Isd_model_small^2 + se_rqmc_small^2);
         relHalf_comb = 1.96 * CV_total;  % 95% half-width as fraction of mean
         
-        fprintf(['r=%2d  +%2d  C=%.2f gamma=%.2f qLoc=%d  ' ...
-                 'logI_rel=%.3g  CV_model=%.4f  CV_rqmc=%.4f  half%%=%.2f%%  total=%d\n'], ...
-                rounds, size(newU,1), C, gamma, qLocal, ...
-                logIbar_small_rel, Isd_model_small, se_rqmc_small, ...
-                100*relHalf_comb, addedTotal);
+        fprintf('Round %2d: added %2d pts | Uncertainty: %.2f%% | Total pts: %d\n', ...
+                rounds, size(newU,1), 100*relHalf_comb, addedTotal);
 
         if relHalf_comb <= tolRelCI
             fprintf('Stop: combined relative half-width <= %.1f%%\n', 100*tolRelCI);
@@ -535,10 +531,10 @@ function d = row_dist(u, U)
 end
 
 function [logI_bar, se_rqmc, sd_model_bar] = rqmc_integral_mean_and_SE(gpr, N, R, jacobian_fn, d)
-% RQMC_INTEGRAL_MEAN_AND_SE - Returns uncertainties in log-space (additive)
+% RQMC_INTEGRAL_MEAN_AND_SE - Pure log-space uncertainty computation
 
     logIvals = zeros(R,1); 
-    sd_model_per_scramble = zeros(R,1);
+    logCV_model = zeros(R,1);  % Store log(CV) for each scramble
     sob = scramble(sobolset(d),'MatousekAffineOwen');
     ln10 = log(10);
     
@@ -553,27 +549,35 @@ function [logI_bar, se_rqmc, sd_model_bar] = rqmc_integral_mean_and_SE(gpr, N, R
         mu_e = ln10 * mu;
         sd_e = ln10 * sd;
         
-        % Log-integral (mean)
         log_w = log(w);
         log_integrand = log_w + mu_e + 0.5*sd_e.^2;
         max_log = max(log_integrand);
         logI_r = max_log + log(sum(exp(log_integrand - max_log)));
         logIvals(r) = logI_r;
         
-        % Model uncertainty: propagate GP variance through integral
-        % For small CV: Var(log I) H (sigma_I / I)^2 = CV^2
-        % Compute CV from GP variance
-        Lmean = exp(mu_e + 0.5*sd_e.^2);
-        Lvar = exp(2*mu_e + sd_e.^2) .* (exp(sd_e.^2) - 1);
-        I_mean_r = sum(w .* Lmean);
-        I_var_r = sum((w.^2) .* Lvar);
+        % ========== Compute CV in log-space ==========
+        % CV^2 = Var(I) / E[I]^2
+        % log(CV^2) = log(Var(I)) - 2*log(E[I])
+        % log(CV) = 0.5 * [log(Var(I)) - 2*log(E[I])]
         
-        % CV = sqrt(Var) / mean; for log: sd(log I) H CV
-        if I_mean_r > 0 && I_var_r > 0
-            CV_r = sqrt(I_var_r) / I_mean_r;
-            sd_model_per_scramble(r) = CV_r;
+        % E[I] in log-space (already computed above)
+        logI_mean = logI_r;
+        
+        % Var(I) = sum(w_i^2 * Var(L_i))
+        % In log-space:
+        log_w2 = 2*log_w;  % log(w^2)
+        log_varL = 2*mu_e + sd_e.^2 + log(exp(sd_e.^2) - 1);  % log(Var(L_i))
+        log_varContrib = log_w2 + log_varL;  % log(w_i^2 * Var(L_i))
+        
+        % Sum variance contributions in log-space
+        max_logvar = max(log_varContrib);
+        if isfinite(max_logvar)
+            logI_var = max_logvar + log(sum(exp(log_varContrib - max_logvar)));
+            
+            % log(CV) = 0.5 * [log(Var) - 2*log(Mean)]
+            logCV_model(r) = 0.5 * (logI_var - 2*logI_mean);
         else
-            sd_model_per_scramble(r) = 0;
+            logCV_model(r) = -inf;  % Zero variance
         end
     end
     
@@ -588,13 +592,21 @@ function [logI_bar, se_rqmc, sd_model_bar] = rqmc_integral_mean_and_SE(gpr, N, R
     
     logI_bar = max_logI + log(mean(exp(logIvals - max_logI)));
     
-    % RQMC uncertainty (already in log-space units = CV)
+    % RQMC uncertainty (std of log values = CV)
     se_rqmc = std(logIvals, 0) / sqrt(R);
     
-    % Model uncertainty (average CV across scrambles)
-    sd_model_bar = mean(sd_model_per_scramble);
+    % Model uncertainty: average CV across scrambles
+    % Average log(CV) values in log-space, then exponentiate
+    finite_logCV = logCV_model(isfinite(logCV_model));
+    if ~isempty(finite_logCV)
+        max_logCV = max(finite_logCV);
+        mean_logCV = max_logCV + log(mean(exp(finite_logCV - max_logCV)));
+        sd_model_bar = exp(mean_logCV);
+    else
+        sd_model_bar = 0;
+    end
     
-    if ~isfinite(sd_model_bar)
+    if ~isfinite(sd_model_bar) || sd_model_bar < 0
         sd_model_bar = 0;
     end
 end

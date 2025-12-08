@@ -1,0 +1,8 @@
+Bayesian IMR Analysis Summary
+Material ID: 0
+Models tested: NEWT
+Best model: NEWT (P=1.0000)
+Computation time: 253.5 seconds (4.2 minutes)
+
+Model Posteriors:
+  NEWT: 1.000000
