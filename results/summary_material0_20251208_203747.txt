@@ -1,9 +1,0 @@
-Bayesian IMR Analysis Summary
-Material ID: 0
-Models tested: NEWT, QKV
-Best model: QKV (P=1.0000)
-Computation time: 173.4 seconds (2.9 minutes)
-
-Model Posteriors:
-  NEWT: 0.000000
-  QKV: 1.000000
