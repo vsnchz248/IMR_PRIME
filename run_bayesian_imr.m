@@ -1,447 +1,198 @@
 function results = run_bayesian_imr(material_id, varargin)
-% RUN_BAYESIAN_IMR - Main function for Bayesian model selection on IMR data
+% RUN_BAYESIAN_IMR
+%   High-level driver for Bayesian IMR model selection.
 %
-% Syntax:
-%   results = run_bayesian_imr(material_id)
-%   results = run_bayesian_imr(material_id, Name, Value)
+%   results = run_bayesian_imr(material_id, 'Name', Value, ...)
 %
-% Inputs:
-%   material_id - Material ID (0 = synthetic, 1-9 = experimental)
+% Recognized NameValue pairs:
+%   'models'     - cell array of model names (e.g., {'newt','kv','qkv',...})
+%   'parallel'   - logical (default: false)
+%   'gprOpts'    - struct passed to active_integrate_logaware via
+%                  bayesian_model_selection_gpr (field .active)
+%   'verbose'    - logical (default: true)
+%   'saveFigs'   - logical (default: false)  [placeholder, not heavily used]
+%   'saveResults'- logical (default: true)
+%   'outputDir'  - string, results directory (default: './results')
 %
-% Optional Name-Value Pairs:
-%   'models'      - Cell array of model names (default: all 7 models)
-%   'parallel'    - Use parallel processing (default: true)
-%   'numWorkers'  - Number of parallel workers (default: auto)
-%   'gprOpts'     - GPR options struct (default: production settings)
-%   'verbose'     - Display detailed output (default: true)
-%   'saveFigs'    - Save figures to disk (default: false)
-%   'saveResults' - Save results to .mat file (default: false)
-%   'outputDir'   - Output directory for saved files (default: pwd)
-%
-% Outputs:
-%   results - Structure containing:
-%       .model_posterior - Posterior probability P(M|D) for each model
-%       .log_evidence    - Log evidence for each model
-%       .theta_MAP       - MAP parameters for each model
-%       .best_model      - Name of most probable model
-%       .best_idx        - Index of most probable model
-%       .max_posterior   - Posterior probability of best model
-%       .elapsed_time    - Total computation time (seconds)
-%       .material_id     - Material ID tested
-%       .models          - Model names
-%       .expData         - Experimental data structure
-%       .priors          - Prior structure
-%
-% Example:
-%   % Test synthetic data with all models, parallel
-%   results = run_bayesian_imr(0);
-%
-%   % Test specific models on material 1
-%   results = run_bayesian_imr(1, 'models', {'newt','nh','kv'});
-%
-%   % Run with custom GPR settings, save output
-%   gpr = struct('maxRounds', 50, 'tolRelCI', 0.02);
-%   results = run_bayesian_imr(2, 'gprOpts', gpr, 'saveFigs', true);
-%
-%   % Run serially (no parallel)
-%   results = run_bayesian_imr(0, 'parallel', false);
+% Output:
+%   results - struct used by test_material.m with fields:
+%       .per_model      - per-model struct array from bayesian_model_selection_gpr
+%       .best_model     - name of best model (lowercase)
+%       .best_idx       - index of best model
+%       .max_posterior  - P(M_best | D)
+%       .theta_MAP      - cell array of MAP parameter vectors per model
+%       .elapsed_time   - total wallclock time (seconds)
+%       .N_eff, .axis_need, .kernel_norms (if available)
 
-% Parse inputs
-p = inputParser;
-addRequired(p, 'material_id', @isnumeric);
-addParameter(p, 'models', {'newt','nh','kv','qnh','lm','qkv','sls'}, @iscell);
-addParameter(p, 'parallel', true, @islogical);
-addParameter(p, 'numWorkers', [], @(x) isempty(x) || isnumeric(x));
-addParameter(p, 'gprOpts', [], @(x) isempty(x) || isstruct(x));
-addParameter(p, 'verbose', true, @islogical);
-addParameter(p, 'saveFigs', false, @islogical);
-addParameter(p, 'saveResults', false, @islogical);
-addParameter(p, 'outputDir', pwd, @ischar);
-parse(p, material_id, varargin{:});
+%% Defaults
+cfg.models      = {'newt','kv'};
+cfg.parallel    = false;
+cfg.gprOpts     = struct();
+cfg.verbose     = true;
+cfg.saveFigs    = false;
+cfg.saveResults = true;
+cfg.outputDir   = './results';
 
-models = p.Results.models;
-use_parallel = p.Results.parallel;
-num_workers = p.Results.numWorkers;
-gprOpts = p.Results.gprOpts;
-verbose = p.Results.verbose;
-save_figs = p.Results.saveFigs;
-save_results = p.Results.saveResults;
-output_dir = p.Results.outputDir;
-
-% Default GPR options (production settings)
-if isempty(gprOpts)
-    gprOpts = struct();
-    gprOpts.maxRounds = 30;
-    gprOpts.maxAddedMult = 140;
-    gprOpts.tolRelCI = 0.04;
-    gprOpts.betaGrid = 0.05:0.05:10;
+%% Parse namevalue pairs
+if mod(numel(varargin),2) ~= 0
+    error('run_bayesian_imr:NameValuePairs','NameValue arguments must come in pairs.');
 end
 
-% Print header
-if verbose
-    fprintf('\n╔════════════════════════════════════════════════════╗\n');
-    fprintf(  '║   BAYESIAN MODEL SELECTION FOR IMR                 ║\n');
-    fprintf(  '╚════════════════════════════════════════════════════╝\n');
-    fprintf('\nMaterial ID: %d\n', material_id);
-    fprintf('Models: %s\n', strjoin(upper(models), ', '));
-    fprintf('Parallel: %s\n', mat2str(use_parallel));
-end
-
-%% Setup parallel pool
-if use_parallel
-    if verbose
-        fprintf('\n--- Setting Up Parallel Computing ---\n');
-    end
-    
-    % Get current pool
-    pool = gcp('nocreate');
-    
-    if isempty(pool)
-        % No pool exists, create one
-        if isempty(num_workers)
-            % Auto-detect number of workers
-            pool = parpool();
-            if verbose
-                fprintf('✓ Started parallel pool with %d workers\n', pool.NumWorkers);
-            end
-        else
-            % Use specified number
-            pool = parpool(num_workers);
-            if verbose
-                fprintf('✓ Started parallel pool with %d workers\n', num_workers);
-            end
-        end
-    else
-        % Pool exists
-        if verbose
-            fprintf('✓ Using existing parallel pool (%d workers)\n', pool.NumWorkers);
-        end
-    end
-else
-    if verbose
-        fprintf('\n--- Running Serially (no parallel) ---\n');
+for k = 1:2:numel(varargin)
+    name  = lower(varargin{k});
+    value = varargin{k+1};
+    switch name
+        case 'models'
+            cfg.models = value;
+        case 'parallel'
+            cfg.parallel = logical(value);
+        case 'gpropts'
+            cfg.gprOpts = value;
+        case 'verbose'
+            cfg.verbose = logical(value);
+        case 'savefigs'
+            cfg.saveFigs = logical(value);
+        case 'saveresults'
+            cfg.saveResults = logical(value);
+        case 'outputdir'
+            cfg.outputDir = value;
+        otherwise
+            warning('run_bayesian_imr:UnknownOption','Unknown option "%s" ignored.', name);
     end
 end
 
-%% Load Data
-if verbose
-    fprintf('\n--- Loading Data ---\n');
+if cfg.verbose
+    fprintf('\n??????????????????????????????????????????????????????\n');
+    fprintf(  '?   BAYESIAN MODEL SELECTION FOR IMR                 ?\n');
+    fprintf(  '??????????????????????????????????????????????????????\n\n');
+    fprintf('Material ID: %d\n', material_id);
+    fprintf('Models: %s\n', strjoin(cfg.models, ', '));
+    fprintf('Parallel: %s\n\n', mat2str(cfg.parallel));
 end
 
-opts_data = struct();
-opts_data.verbose = false;
-expData = prepare_data(material_id, opts_data);
+tAll = tic;
 
-if verbose
-    fprintf('✓ Loaded: %d trials, %d time points\n', ...
-            size(expData.Rmatrix,2), size(expData.Rmatrix,1));
-    fprintf('✓ Gated points: %d (%.1f%%)\n', ...
+%% 1. Prepare data
+if cfg.verbose
+    fprintf('--- Loading Data ---\n\n');
+end
+
+prepOpts = struct('verbose', cfg.verbose);
+expData  = prepare_data(material_id, prepOpts);
+
+if cfg.verbose
+    fprintf('? Loaded: %d trials, %d time points\n', size(expData.Rmatrix,2), size(expData.Rmatrix,1));
+    if isfield(expData,'mask') && ~isempty(expData.mask)
+        fprintf('? Gated points: %d (%.1f%%)\n\n', ...
             nnz(expData.mask), 100*nnz(expData.mask)/numel(expData.mask));
+    end
 end
 
-%% Build Priors
-if verbose
-    fprintf('\n--- Building Priors ---\n');
+%% 2. Build priors
+if cfg.verbose
+    fprintf('--- Building Priors ---\n');
 end
 
-opts_prior = struct();
-opts_prior.verbose = false;
-opts_prior.N_eff = 2 * nnz(expData.mask);
-priors = build_priors(expData, opts_prior);
+priorOpts.quiet = ~cfg.verbose;
+priors = build_priors(expData, cfg.models, priorOpts);
 
-if verbose
-    fprintf('✓ N_eff = %d\n', priors.N_eff);
-    fprintf('✓ Kernel norms: ||A*||=%.2e, ||B||=%.2e\n', ...
+if cfg.verbose
+    if isfield(priors,'kernel_norms')
+        fprintf('build_priors: ||A*|| = %.3e, ||B|| = %.3e\n', ...
             priors.kernel_norms.normA, priors.kernel_norms.normB);
-end
-
-%% Run Bayesian Model Selection
-if verbose
-    fprintf(  '\n╔════════════════════════════════════════════════════╗\n');
-    fprintf(    '║   RUNNING BAYESIAN MODEL SELECTION                 ║\n');
-    if use_parallel
-        fprintf('║   (Parallel: %d models simultaneously)             ║\n', ...
-                min(numel(models), pool.NumWorkers));
-    else
-        fprintf('║   (Serial: one model at a time)                    ║\n');
     end
-    fprintf(    '╚════════════════════════════════════════════════════╝\n');
-end
-
-opts = struct();
-opts.gprOpts = gprOpts;
-opts.verbose = verbose;
-opts.parallel = use_parallel;  % Pass parallel flag to selection function
-
-tic;
-results_raw = bayesian_model_selection_gpr(expData, priors, models, opts);
-elapsed = toc;
-
-%% Package Results
-results = results_raw;
-results.elapsed_time = elapsed;
-results.material_id = material_id;
-results.models = models;
-results.expData = expData;
-results.priors = priors;
-results.gprOpts = gprOpts;
-results.parallel_used = use_parallel;
-
-%% Display Results
-if verbose
-    display_results(results, models);
-end
-
-%% Validation
-if verbose
-    validate_results(results, models);
-end
-
-%% Save Results
-if save_results
-    % Add printed output summary to results
-    results.summary = struct();
-    results.summary.material_id = material_id;
-    results.summary.models = models;
-    results.summary.best_model = results.best_model;
-    results.summary.best_posterior = results.max_posterior;
-    results.summary.elapsed_time = elapsed;
-    results.summary.num_workers = [];
-    if use_parallel
-        pool = gcp('nocreate');
-        if ~isempty(pool)
-            results.summary.num_workers = pool.NumWorkers;
-        end
+    if isfield(priors,'axis_need')
+        fprintf('  axis_need: elastic=%.3f, maxwell=%.3f, nonlinear=%.3f\n', ...
+            priors.axis_need.elastic, ...
+            priors.axis_need.maxwell, ...
+            priors.axis_need.nonlinear);
     end
-    
-    % Create text summary for easy viewing
-    summary_text = sprintf('Bayesian IMR Analysis Summary\n');
-    summary_text = [summary_text sprintf('Material ID: %d\n', material_id)];
-    summary_text = [summary_text sprintf('Models tested: %s\n', strjoin(upper(models), ', '))];
-    summary_text = [summary_text sprintf('Best model: %s (P=%.4f)\n', upper(results.best_model), results.max_posterior)];
-    summary_text = [summary_text sprintf('Computation time: %.1f seconds (%.1f minutes)\n', elapsed, elapsed/60)];
-    summary_text = [summary_text sprintf('\nModel Posteriors:\n')];
-    for i = 1:numel(models)
-        summary_text = [summary_text sprintf('  %s: %.6f\n', upper(models{i}), results.model_posterior(i))];
+    if isfield(priors,'N_eff')
+        fprintf('? N_eff = %d\n', priors.N_eff);
     end
-    results.summary.text = summary_text;
-    
-    % Save
-    timestamp = datestr(now, 'yyyymmdd_HHMMSS');
-    filename = sprintf('bayesian_imr_material%d_%s.mat', material_id, timestamp);
-    filepath = fullfile(output_dir, filename);
-    save(filepath, 'results');
-    
-    % Also save text summary
-    txt_filename = sprintf('summary_material%d_%s.txt', material_id, timestamp);
-    txt_filepath = fullfile(output_dir, txt_filename);
-    fid = fopen(txt_filepath, 'w');
-    fprintf(fid, '%s', summary_text);
-    fclose(fid);
-    
-    if verbose
-        fprintf('\n✓ Saved results to: %s\n', filename);
-        fprintf('✓ Saved summary to: %s\n', txt_filename);
+    if isfield(priors,'kernel_norms')
+        fprintf('? Kernel norms: ||A*||=%.2e, ||B||=%.2e\n\n', ...
+            priors.kernel_norms.normA, priors.kernel_norms.normB);
     end
 end
 
-%% Create Figures
-if verbose || save_figs
-    figs = create_figures(results, models);
-    
-    if save_figs
-        % Save figures
-        timestamp = datestr(now, 'yyyymmdd_HHMMSS');
-        
-        % Figure 1: Model comparison
-        fig1_name = sprintf('model_comparison_material%d_%s.png', material_id, timestamp);
-        fig1_path = fullfile(output_dir, fig1_name);
-        saveas(figs(1), fig1_path);
-        if verbose
-            fprintf('✓ Saved: %s\n', fig1_name);
-        end
-        
-        % Figure 2: Parameters
-        fig2_name = sprintf('map_parameters_material%d_%s.png', material_id, timestamp);
-        fig2_path = fullfile(output_dir, fig2_name);
-        saveas(figs(2), fig2_path);
-        if verbose
-            fprintf('✓ Saved: %s\n', fig2_name);
-        end
+%% 3. Run GPR-based Bayesian model selection
+if cfg.verbose
+    fprintf('??????????????????????????????????????????????????????\n');
+    fprintf(  '?   RUNNING BAYESIAN MODEL SELECTION                 ?\n');
+    fprintf(  '?   (Serial: one model at a time)                    ?\n');
+    fprintf(  '??????????????????????????????????????????????????????\n');
+end
+
+bmOpts = struct();
+bmOpts.parallel    = cfg.parallel;
+bmOpts.useBICprior = true;
+bmOpts.active      = cfg.gprOpts;
+
+results_raw = bayesian_model_selection_gpr(expData, priors, cfg.models, bmOpts);
+
+%% 4. Extract summary + best model
+per = results_raw.per_model;
+nM  = numel(per);
+
+log10Ev = [per.log10Evidence];
+post    = [per.posterior];
+
+[~, best_idx] = max(post);
+best_model    = per(best_idx).name;
+
+theta_MAP_cell = cell(1, nM);
+for k = 1:nM
+    theta_MAP_cell{k} = per(k).mapTheta;
+end
+
+elapsed = toc(tAll);
+
+%% 5. Assemble results struct for caller
+results = struct();
+results.per_model     = per;
+results.N_eff         = results_raw.N_eff;
+if isfield(results_raw,'axis_need')
+    results.axis_need = results_raw.axis_need;
+end
+if isfield(results_raw,'kernel_norms')
+    results.kernel_norms = results_raw.kernel_norms;
+end
+results.best_model    = best_model;
+results.best_idx      = best_idx;
+results.max_posterior = post(best_idx);
+results.theta_MAP     = theta_MAP_cell;
+results.elapsed_time  = elapsed;
+
+%% 6. Print concise summary (only once)
+if cfg.verbose
+    fprintf('========================================\n');
+    fprintf('  Summary\n');
+    fprintf('========================================\n');
+    fprintf('Model     log10(Evid)   log(Prior)       P(M|D)\n');
+    fprintf('----------------------------------------\n');
+    for i = 1:nM
+        fprintf('%-8s %12.5g %12.5g %12.6f\n', ...
+            upper(per(i).name), ...
+            per(i).log10Evidence, ...
+            per(i).logModelPrior, ...
+            per(i).posterior);
+    end
+    fprintf('========================================\n\n');
+end
+
+%% 7. Save results if requested
+if cfg.saveResults
+    if ~exist(cfg.outputDir,'dir')
+        mkdir(cfg.outputDir);
+    end
+    timestamp = datestr(now,'yyyymmdd_HHMMSS');
+    fname     = sprintf('bayesian_imr_material%d_%s.mat', material_id, timestamp);
+    fpath     = fullfile(cfg.outputDir, fname);
+    save(fpath, 'results', 'results_raw', 'expData', 'priors', 'cfg');
+    if cfg.verbose
+        fprintf('Results saved to %s\n', fpath);
     end
 end
 
-if verbose
-    fprintf('\n');
-end
-
-end % main function
-
-
-%% Helper Functions
-
-function display_results(results, models)
-    fprintf('\n╔═════════════╗\n');
-    fprintf(  '║   RESULTS   ║\n');
-    fprintf(  '╚═════════════╝\n');
-    
-    fprintf('\nModel Posteriors (sorted by probability):\n');
-    [sorted_post, sort_idx] = sort(results.model_posterior, 'descend');
-    for i = 1:numel(models)
-        idx = sort_idx(i);
-        fprintf('  %d. %s: P(M|D) = %.4f\n', i, upper(models{idx}), sorted_post(i));
-    end
-    
-    fprintf('\nLog10 Evidence:\n');
-    for i = 1:numel(models)
-        fprintf('  %s: %.6g\n', upper(models{i}), results.log_evidence(i)/log(10));
-    end
-    
-    fprintf('\nMAP Parameters:\n');
-    param_dims = [1 1 2 2 2 3 3];
-    for i = 1:numel(models)
-        fprintf('  %s (%dD): ', upper(models{i}), param_dims(i));
-        fprintf('%.4g ', results.theta_MAP{i});
-        fprintf('\n');
-    end
-    
-    fprintf('\nBest Model: %s (P = %.4f)\n', ...
-            upper(results.best_model), results.max_posterior);
-    
-    fprintf('\nComputation Time: %.1f sec (%.1f min)\n', ...
-            results.elapsed_time, results.elapsed_time/60);
-    
-    % Performance breakdown per model
-    if isfield(results, 'performance')
-        fprintf('\n--- Performance Breakdown ---\n');
-        fprintf('Model     Time(sec)  Evals  Time/Eval(ms)\n');
-        fprintf('--------------------------------------------\n');
-        for i = 1:numel(models)
-            time_per_eval = 1000 * results.performance.model_times(i) / results.performance.model_evals(i);
-            fprintf('%-6s    %8.1f  %5d      %8.2f\n', ...
-                    upper(models{i}), ...
-                    results.performance.model_times(i), ...
-                    results.performance.model_evals(i), ...
-                    time_per_eval);
-        end
-        fprintf('--------------------------------------------\n');
-        avg_time_per_eval = 1000 * results.performance.total_time / results.performance.total_evals;
-        fprintf('TOTAL     %8.1f  %5d      %8.2f\n', ...
-                results.performance.total_time, ...
-                results.performance.total_evals, ...
-                avg_time_per_eval);
-    end
-end
-
-
-function validate_results(results, models)
-    fprintf('\n╔════════════════════════╗\n');
-    fprintf(  '║   VALIDATION CHECKS    ║\n');
-    fprintf(  '╚════════════════════════╝\n');
-    
-    all_pass = true;
-    
-    % Check 1: Posteriors sum to 1
-    sum_post = sum(results.model_posterior);
-    if abs(sum_post - 1.0) < 1e-10
-        fprintf('✓ Model posteriors sum to 1.0\n');
-    else
-        fprintf('✗ Model posteriors sum to %.10f (should be 1.0)\n', sum_post);
-        all_pass = false;
-    end
-    
-    % Check 2: All evidences finite
-    if all(isfinite(results.log_evidence))
-        fprintf('✓ All log evidences are finite\n');
-    else
-        fprintf('✗ Some log evidences are not finite\n');
-        all_pass = false;
-    end
-    
-    % Check 3: MAP parameters reasonable
-    param_ok = true;
-    for i = 1:numel(models)
-        theta = results.theta_MAP{i};
-        if any(~isfinite(theta)) || any(theta <= 0)
-            fprintf('✗ %s: MAP parameters not positive/finite\n', upper(models{i}));
-            param_ok = false;
-            all_pass = false;
-        end
-    end
-    if param_ok
-        fprintf('✓ All MAP parameters are positive and finite\n');
-    end
-    
-    % Check 4: Parameter dimensions
-    expected_dims = [1 1 2 2 2 3 3];
-    dim_ok = true;
-    for i = 1:numel(models)
-        if numel(results.theta_MAP{i}) ~= expected_dims(i)
-            fprintf('✗ %s should have %d parameters, has %d\n', ...
-                    upper(models{i}), expected_dims(i), numel(results.theta_MAP{i}));
-            dim_ok = false;
-            all_pass = false;
-        end
-    end
-    if dim_ok
-        fprintf('✓ All models have correct parameter dimensions\n');
-    end
-    
-    if ~all_pass
-        fprintf('\n⚠ Some validation checks failed\n');
-    end
-end
-
-
-function figs = create_figures(results, models)
-    % Figure 1: Model comparison
-    figs(1) = figure('Position', [100 100 1200 500]);
-    
-    subplot(1,3,1);
-    bar(results.model_posterior);
-    set(gca, 'XTickLabel', upper(models), 'XTickLabelRotation', 45);
-    ylabel('Posterior Probability P(M|D)');
-    xlabel('Model');
-    title(sprintf('Model Posterior (Material %d)', results.material_id));
-    grid on;
-    ylim([0 max(results.model_posterior)*1.1]);
-    
-    subplot(1,3,2);
-    bar(results.log_evidence / log(10));
-    set(gca, 'XTickLabel', upper(models), 'XTickLabelRotation', 45);
-    ylabel('log_{10} Evidence');
-    xlabel('Model');
-    title('Model Evidence');
-    grid on;
-    
-    subplot(1,3,3);
-    [sorted_post, sort_idx] = sort(results.model_posterior, 'descend');
-    bar([sorted_post(1:min(3,end)); 0]);
-    labels = upper(models(sort_idx(1:min(3,end))));
-    if numel(labels) < 3
-        labels = [labels, repmat({''}, 1, 3-numel(labels))];
-    end
-    labels{end+1} = '';
-    set(gca, 'XTickLabel', labels);
-    ylabel('Posterior Probability');
-    title('Top Models');
-    grid on;
-    ylim([0 1]);
-    
-    % Figure 2: Parameter comparison
-    figs(2) = figure('Position', [100 100 1000 600]);
-    param_dims = [1 1 2 2 2 3 3];
-    for i = 1:numel(models)
-        subplot(3,3,i);
-        theta = results.theta_MAP{i};
-        bar(theta);
-        title(sprintf('%s (P=%.3f)', upper(models{i}), results.model_posterior(i)));
-        ylabel('Parameter Value');
-        xlabel('Parameter Index');
-        grid on;
-        if i <= numel(models)
-            xlim([0.5 param_dims(i)+0.5]);
-        end
-    end
-    sgtitle(sprintf('MAP Parameters (Material %d)', results.material_id));
 end

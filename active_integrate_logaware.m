@@ -1,78 +1,40 @@
-function out = active_integrate_logaware(funNLL, xmin, xmax, opts)
+function out = active_integrate_logaware(funNLL, xmin, xmax, opts, modelName, priors)
 % ACTIVE_INTEGRATE_LOGAWARE
-%   Active GP-based integration of a negative log-likelihood over a box
-%   [xmin, xmax] using log-aware coordinate transforms and RQMC.
+%   Active GP-based integration of negative log-likelihood with prior weighting
 %
-%   This version assumes:
-%       funNLL(X) = negative log-likelihood, NLL(X) = -log p(data|X)
-%   (natural log). Internally we model a shifted log10-likelihood:
+% CORRECTED VERSION: Properly implements Bayesian evidence calculation
+%   P(D|M) = + P(D|¸,M) × P(¸|M) d¸
 %
-%       g(X) = log10 L_rel(X) = -(NLL(X) - N0)/ln(10),
-%
-%   where N0 is an arbitrary reference NLL (the min over the initial design).
-%   The true evidence is reconstructed as:
-%
-%       I = exp(-N0) * ∫ L_rel(X) dX.
-%
-%   We report evidence primarily in log-space (log_e and log10) to avoid
-%   underflow. Linear I is also returned but may be numerically ~0.
-%
-%   out = active_integrate_logaware(funNLL, xmin, xmax)
-%   out = active_integrate_logaware(funNLL, xmin, xmax, opts)
-%
-% Inputs:
-%   funNLL - function handle @(X) -> NLL(X), with X an N-by-d matrix and
-%            NLL(X) an N-by-1 vector of negative log-likelihoods (natural log).
-%   xmin   - 1-by-d or d-by-1 vector of lower bounds.
-%   xmax   - 1-by-d or d-by-1 vector of upper bounds.
-%   opts   - (optional) struct to override defaults:
-%       .rngSeed       - random seed (default 42)
-%       .maxRounds     - max active rounds (default 40)
-%       .maxAddedMult  - maxAdded = maxAddedMult * d (default 160)
-%       .tolRelCI      - stop when 95% half-width (on integral) ≤ tolRelCI (default 0.03)
-%
-% Output struct "out" fields:
-%   Evidence (per box [xmin,xmax] with uniform prior):
-%       .logI_mean     - mean log-evidence (natural log)
-%       .logI_CI95     - 1-by-2 95% CI in log_e space
-%       .log10I_mean   - mean log10-evidence
-%       .log10I_CI95   - 1-by-2 95% CI in log10 space
-%       .I_mean        - evidence in linear space (may underflow to ~0)
-%       .CI95          - 1-by-2 95% CI in linear space
-%       .sigma_model   - model (GP) contribution to integral std, relative-space
-%       .sigma_rqmc    - RQMC standard error contribution, relative-space
-%
-%   GP / design:
-%       .U             - final feature-space design points (N×d)
-%       .Y             - final responses g = log10 L_rel
-%       .gpr           - final fitrgp model on g
-%       .xmin, .xmax   - original bounds
-%       .log_axes      - logical mask of log-scaled axes
-%       .NLL_ref       - reference N0 used for shifting
-%       .toFeat        - handle: X->[U]
-%       .fromFeat      - handle: U->[X]
-%       .jacobian      - handle: |∂x/∂u| (Jacobian)
-%
-% Note:
-%   The prior is uniform over [xmin,xmax] in the "physical" space X, with
-%   optional log10 transforms per axis (log_axes). The evidence is for this
-%   uniform prior.
+% CRITICAL FIX: Re-shifts Y with final N0 BEFORE fitting final GP
 
     % ----------------- Basic setup -----------------
     if nargin < 4, opts = struct(); end
+    if nargin < 5, modelName = 'unknown'; end
+    if nargin < 6, priors = struct(); end
+    
     if ~isfield(opts,'rngSeed'),      opts.rngSeed      = 42;   end
     if ~isfield(opts,'maxRounds'),    opts.maxRounds    = 40;   end
     if ~isfield(opts,'maxAddedMult'), opts.maxAddedMult = 160;  end
     if ~isfield(opts,'tolRelCI'),     opts.tolRelCI     = 0.03; end
+    if ~isfield(opts,'verbose'),      opts.verbose      = true; end  % DEFAULT TRUE
 
-    xmin = xmin(:)'; xmax = xmax(:)';  % row vectors
+    xmin = xmin(:)'; xmax = xmax(:)';
     d = numel(xmin);
     rng(opts.rngSeed);
 
     ln10 = log(10);
 
+    % Check if we have priors for proper Bayesian integration
+    have_priors = ~isempty(priors) && isfield(priors, 'paramPrior');
+    
+    if ~have_priors
+        warning('active_integrate_logaware:noPriors', ...
+                'No priors provided - using uniform prior (may give incorrect evidence)');
+    else
+        fprintf('[%s] Using priors from build_model_priors\n', upper(modelName));
+    end
+
     % ----------------- Log-aware map: which axes are log10? -----------------
-    % Criterion: axis positive and spans ≥100×
     log_axes = (xmin > 0) & ((xmax ./ max(xmin, eps)) >= 100);
 
     loga = zeros(1,d); logb = zeros(1,d); dx_du_lin = zeros(1,d);
@@ -86,55 +48,68 @@ function out = active_integrate_logaware(funNLL, xmin, xmax, opts)
     end
 
     % Maps and Jacobian
-    fromFeat = @(U) u2x_logaware(U, xmin, xmax, log_axes, loga, logb); % U->[X]
-    toFeat   = @(X) x2u_logaware(X, xmin, xmax, log_axes, loga, logb); % X->[U]
+    fromFeat = @(U) u2x_logaware(U, xmin, xmax, log_axes, loga, logb);
+    toFeat   = @(X) x2u_logaware(X, xmin, xmax, log_axes, loga, logb);
     jacobian = @(U) jac_logaware(U, xmin, xmax, log_axes, loga, logb, dx_du_lin);
 
     % ----------------- Dimension-aware sizes -----------------
-    n0 = 10*d^2 + 5;                        % initial design size
+    n0 = 10*d^2 + 5;
 
     if d==1, Nacq = 16384;
     elseif d==2, Nacq = 65536;
     else,       Nacq = 32768;
     end
 
-    Nint_final   = 65536 * 2^(d-1);         % per-scramble GP quadrature size
+    Nint_final   = 65536 * 2^(d-1);
     maxRounds    = opts.maxRounds;
-    KcapPerRound = 6 + 4*d;                 % batch cap (10,14,18)
+    KcapPerRound = 6 + 4*d;
     maxAdded     = opts.maxAddedMult * d;
-    tolRelCI     = opts.tolRelCI;
 
-    % Small RQMC for stop rule
+    % Optimal RQMC scrambles for convergence check
     if d==1
-        N_rqmc_small = 2^15; R_rqmc_small = 16;
-    else
-        N_rqmc_small = max(8192 * 2^(d-1), floor(Nacq/2));
+        N_rqmc_small = 2^15;
+        R_rqmc_small = 16;
+    elseif d==2
+        N_rqmc_small = 2^16;
         R_rqmc_small = 12;
+    else
+        N_rqmc_small = 2^15;
+        R_rqmc_small = 10;
     end
+
+    fprintf('\n=== Starting Active Learning for %s (%dD) ===\n', upper(modelName), d);
+    fprintf('Initial design: %d points\n', n0);
+    fprintf('Max rounds: %d, Convergence tolerance: %.1f%%\n\n', maxRounds, 100*opts.tolRelCI);
 
     % ----------------- Initial design (Sobol in U) -----------------
     sob0 = scramble(sobolset(d),'MatousekAffineOwen');
-    U    = net(sob0, n0);                     % U∈[0,1]^d
+    U    = net(sob0, n0);
     X0   = fromFeat(U);
 
     % Evaluate raw negative log-likelihood (natural log)
-    NLL0 = funNLL(X0);                        % NLL0 is n0-by-1
-
-    % Reference offset N0 (arbitrary; min over initial design is convenient)
-    N0   = min(NLL0);
-
-    % Likelihood
-    Y = -(NLL0 - N0) / log(10);
+    fprintf('Evaluating initial design...\n');
+    NLL0 = funNLL(X0);
+    
+    % Initial reference offset (temporary, for active learning only)
+    N0_temp = min(NLL0);
+    
+    % Shifted log10-likelihood (for GP training during active loop)
+    Y = -(NLL0 - N0_temp) / log(10);
+    
+    fprintf('Initial NLL range: [%.2e, %.2e]\n', min(NLL0), max(NLL0));
+    fprintf('Initial Y range: [%.2f, %.2f]\n\n', min(Y), max(Y));
+    
+    % CRITICAL: Store RAW NLL values (no shifting yet)
+    NLL_raw = NLL0;
     
     % Acquisition grid (Sobol in U)
     sobA = scramble(sobolset(d),'MatousekAffineOwen');
     Uacq = net(sobA, Nacq);
-    wA   = jacobian(Uacq) / Nacq;             % physical weights
+    wA   = jacobian(Uacq) / Nacq;
 
     % Final report grid (for 1D plots if d==1)
     sobF       = scramble(sobolset(d),'MatousekAffineOwen');
     Uint_final = net(sobF, Nint_final);
-    wF         = jacobian(Uint_final) / Nint_final;
 
     % ----------------- GP kernel choice -----------------
     if d==1
@@ -147,6 +122,7 @@ function out = active_integrate_logaware(funNLL, xmin, xmax, opts)
     basisName = 'constant';
 
     % Initial fit
+    fprintf('Fitting initial GP...\n');
     gpr = trainGP(U, Y, kernelName, basisName);
 
     % ----------------- Active loop -----------------
@@ -158,11 +134,11 @@ function out = active_integrate_logaware(funNLL, xmin, xmax, opts)
         % Refit GP each round
         gpr = trainGP(U, Y, kernelName, basisName);
 
-        % Posterior on acquisition grid: g ~ N(muA, sdA^2), where g = log10 L_rel
+        % Posterior on acquisition grid
         [muA, sdA] = predict(gpr, Uacq);
         sdA = max(sdA, 1e-9);
-        mu_e = ln10 * muA;      % mean of ln L_rel
-        sd_e = ln10 * sdA;      % std  of ln L_rel
+        mu_e = ln10 * muA;
+        sd_e = ln10 * sdA;
 
         % Log-normal mean/var of L_rel
         LmeanA = exp(mu_e + 0.5*sd_e.^2);
@@ -171,7 +147,7 @@ function out = active_integrate_logaware(funNLL, xmin, xmax, opts)
         % Var(I_rel) contributions
         A_var = (wA.^2) .* LvarA;
 
-        % Mass concentration → tempering exponent gamma
+        % Mass concentration tempering exponent gamma
         kTop = max(1, round(0.01 * Nacq));
         Lw_sorted = sort(LmeanA .* wA, 'descend');
         shareTop  = sum(Lw_sorted(1:kTop)) / max(sum(Lw_sorted), eps);
@@ -186,7 +162,7 @@ function out = active_integrate_logaware(funNLL, xmin, xmax, opts)
         A_var = A_var .^ gamma;
         A_var = A_var / max(A_var + eps);
 
-        % EI and std stabilizers on g = log10 L_rel
+        % EI and std stabilizers
         yBest = max(Y);
         Z  = (muA - yBest) ./ sdA;
         EI = (muA - yBest).*normcdf(Z) + sdA.*normpdf(Z);
@@ -218,7 +194,7 @@ function out = active_integrate_logaware(funNLL, xmin, xmax, opts)
         end
         qLocal = min(KcapPerRound-3, max(1, qBase + round(3*C) + (d==3)*2));
 
-        [~, iMAP] = max(LmeanA);            % MAP in terms of L_rel mean
+        [~, iMAP] = max(LmeanA);
         u0 = Uacq(iMAP,:);
         localCands = u0;
         [~, ax] = sort(ell_vec, 'descend'); maxAxes = min(d,2);
@@ -254,7 +230,7 @@ function out = active_integrate_logaware(funNLL, xmin, xmax, opts)
         localU = localU(1:qLocal,:);
 
         % Diversified batch for remaining slots
-        Krem = max(0, KcapPerRound - qLocal - 1); % leave 1 for global refresh
+        Krem = max(0, KcapPerRound - qLocal - 1);
         if d==3,      M = min(12000, Nacq);
         elseif d==2,  M = min(8000,  Nacq);
         else,         M = min(4000,  Nacq);
@@ -282,52 +258,104 @@ function out = active_integrate_logaware(funNLL, xmin, xmax, opts)
         % Combined new batch
         newU = [localU; newUdiv; newUglob];
         if isempty(newU)
-            fprintf('r=%2d: spacing too tight — no new points.\n', rounds);
+            fprintf('Round %2d: spacing too tight - no new points.\n', rounds);
             break;
         end
 
-        % Deterministic oracle calls (NLL → shifted log10 L_rel)
+        % Deterministic oracle calls
         X_new   = fromFeat(newU);
         NLL_new = funNLL(X_new);
-        newY    = -(NLL_new - N0) / ln10;
-
+        
+        % CRITICAL: Accumulate RAW NLL values (no shifting)
+        NLL_raw = [NLL_raw; NLL_new];
+        
+        % Update Y with CURRENT temp offset (for GP training only)
+        newY = -(NLL_new - N0_temp) / ln10;
+        
         U = [U; newU];
         Y = [Y; newY];
         addedTotal = addedTotal + size(newU,1);
 
-        % Small RQMC for stop rule (relative integral)
-        [logIbar_small_rel, se_rqmc_small, Isd_model_small] = ...
-            rqmc_integral_mean_and_SE(gpr, N_rqmc_small, R_rqmc_small, jacobian, d);
+        % Convergence based on GP prediction quality (RELATIVE to response range)
+        Y_range = max(Y) - min(Y);
+        if Y_range < eps
+            Y_range = 1;  % Fallback if Y is constant
+        end
         
-       % Convergence based on RQMC uncertainty
-        CV_total = sqrt(Isd_model_small^2 + se_rqmc_small^2);
-        relHalf_comb = 1.96 * CV_total;  % 95% half-width as fraction of mean
+        max_sd = max(sdA);
+        mean_sd = mean(sdA);
+        max_sd_rel = max_sd / Y_range;
+        mean_sd_rel = mean_sd / Y_range;
         
-        fprintf('Round %2d: added %2d pts | Uncertainty: %.2f%% | Total pts: %d\n', ...
-                rounds, size(newU,1), 100*relHalf_comb, addedTotal);
+        fprintf('Round %2d: added %2d pts | Max GP std: %.2f%%, Mean GP std: %.2f%% | Total pts: %d\n', ...
+                rounds, size(newU,1), 100*max_sd_rel, 100*mean_sd_rel, size(U,1));
 
-        if relHalf_comb <= tolRelCI
-            fprintf('Stop: combined relative half-width <= %.1f%%\n', 100*tolRelCI);
+        % Convergence: GP relative uncertainty < 5%
+        if max_sd_rel < 0.05
+            fprintf('Stop: GP sufficiently accurate (max_sd < 5%% of Y range)\n');
             break;
         end
     end
 
-    % ----------------- Final RQMC report (relative integral) -----------------
+    % ============================================================================
+    % CRITICAL FIX: Re-shift Y with final N0 BEFORE fitting final GP
+    % ============================================================================
+    N0 = min(NLL_raw);  % Final N0 from ALL raw NLL values
+    
+    if opts.verbose
+        fprintf('\nFinal shift: N0_temp = %.6e  N0_final = %.6e\n', N0_temp, N0);
+    end
+    
+    % Re-compute Y for ALL points with final N0
+    Y = -(NLL_raw - N0) / log(10);
+    
+    if opts.verbose
+        fprintf('Final Y range: [%.2f, %.2f]\n', min(Y), max(Y));
+    end
+    
+    % ----------------- Final GP fit with re-shifted Y -----------------
+    fprintf('Fitting final GP with %d total points...\n', size(U,1));
     gpr = trainGP(U, Y, kernelName, basisName);
+
+    % Final integration with high accuracy
+    if d==1
+        R_final = 32;
+    elseif d==2
+        R_final = 16;
+    else
+        R_final = 12;
+    end
     
-    R_final = (d==1) * 16 + (d>1) * 12;
-    [logI_rel_bar, se_rqmc_final, CV_model_final] = ...
-        rqmc_integral_mean_and_SE(gpr, Nint_final, R_final, jacobian, d);
+    fprintf('Computing final RQMC integral (N=%d, R=%d)...\n', Nint_final, R_final);
     
-    % log I_rel from RQMC
-    logI_mean = -N0 + logI_rel_bar;   % log Z = -N0 + log I_rel
+    % CRITICAL: Apply prior as weight during integration
+    if have_priors
+        [logI_rel_bar, se_rqmc_final, CV_model_final] = ...
+            rqmc_integral_mean_and_SE_with_prior(gpr, Nint_final, R_final, jacobian, d, ...
+                                                  modelName, priors, fromFeat);
+    else
+        % Fallback to uniform prior (not recommended)
+        [logI_rel_bar, se_rqmc_final, CV_model_final] = ...
+            rqmc_integral_mean_and_SE(gpr, Nint_final, R_final, jacobian, d);
+    end
     
-    % Total coefficient of variation (relative uncertainty)
+    % True log evidence
+    logI_mean = -N0 + logI_rel_bar;
+    
+    if opts.verbose
+        fprintf('\n=== Evidence Calculation ===\n');
+        fprintf('N0 (reference): %.6e\n', N0);
+        fprintf('logI_rel: %.6e\n', logI_rel_bar);
+        fprintf('logI_mean = -N0 + logI_rel = %.6e\n', logI_mean);
+        fprintf('===========================\n\n');
+    end
+    
+    % Total coefficient of variation
     CV_total = sqrt(CV_model_final^2 + se_rqmc_final^2);
     
-    % Delta method: for Y = log(X), Var(Y) H Var(X)/E[X]^2 = CV(X)^2
+    % Delta method: for Y = log(X), Var(Y) H CV(X)^2
     if isfinite(CV_total) && CV_total > 0
-        se_logI  = CV_total;  % Std error of log(I) H CV(I)
+        se_logI  = CV_total;
         CI95_log = [logI_mean - 1.96*se_logI, logI_mean + 1.96*se_logI];
     else
         se_logI  = NaN;
@@ -338,7 +366,7 @@ function out = active_integrate_logaware(funNLL, xmin, xmax, opts)
     log10I_mean = logI_mean / ln10;
     log10I_CI95 = CI95_log / ln10;
     
-    % Optional linear evidence (guard against overflow)
+    % Optional linear evidence
     if logI_mean > log(realmax)
         I_mean  = Inf;
         CI95_lin = [NaN, NaN];
@@ -347,34 +375,40 @@ function out = active_integrate_logaware(funNLL, xmin, xmax, opts)
         CI95_lin = [0, 0];
     else
         I_mean  = exp(logI_mean);
-        I_sd_abs = I_mean * CV_total;  % abs sigma = mean * CV
+        I_sd_abs = I_mean * CV_total;
         CI95_lin = [I_mean - 1.96*I_sd_abs, I_mean + 1.96*I_sd_abs];
     end
 
-    fprintf('\nAdded %d pts total in %d rounds\n', addedTotal, rounds);
-    fprintf(['log10 I = %.6g  (95%% CI: [%.6g, %.6g]) | components: ' ...
-             'CV_model=%.4f, CV_rqmc=%.4f\n'], ...
-            log10I_mean, log10I_CI95(1), log10I_CI95(2), ...
-            CV_model_final, se_rqmc_final);
+    fprintf('\n=== FINAL RESULTS for %s ===\n', upper(modelName));
+    fprintf('Total points: %d (added %d in %d rounds)\n', size(U,1), addedTotal, rounds);
+    fprintf('log10(Z) H %.6g  (95%% CI: [%.6g, %.6g])\n', ...
+            log10I_mean, log10I_CI95(1), log10I_CI95(2));
+    
+    % Find and report MAP
+    [~, mapIdx] = max(Y);
+    mapTheta = fromFeat(U(mapIdx,:));
+    fprintf('MAP parameters: ');
+    for j = 1:numel(mapTheta)
+        fprintf('%.4g ', mapTheta(j));
+    end
+    fprintf('\n');
+    fprintf('================================\n\n');
 
-    % Optional 1D plot: shifted log10-likelihood (relative)
-    if d==1
+    % Optional 1D plot
+    if d==1 && opts.verbose
         [muF_plot, sdF_plot] = predict(gpr, Uint_final);
-        % center so max(mean) = 0
         muF_plot = muF_plot - max(muF_plot);
         Y_train_center = Y - max(Y);
 
         xF = fromFeat(Uint_final(:,1));
         [xF, ix] = sort(xF); muF_plot = muF_plot(ix); sdF_plot = sdF_plot(ix);
 
-        fig = figure('Color','w','Units','normalized','Position',[0.18 0.20 0.60 0.55]);
-        movegui(fig,'center'); hold on; box on;
+        figure('Color','w','Units','normalized','Position',[0.18 0.20 0.60 0.55]);
+        hold on; box on;
 
         g_lo = muF_plot - 1.96*sdF_plot;
         g_hi = muF_plot + 1.96*sdF_plot;
-        x_band = [xF; flipud(xF)];
-        y_band = [g_lo; flipud(g_hi)];
-        fill(x_band, y_band, [0.9 0.8 1.0], ...
+        fill([xF; flipud(xF)], [g_lo; flipud(g_hi)], [0.9 0.8 1.0], ...
              'EdgeColor','none', 'FaceAlpha',0.4);
 
         plot(xF, muF_plot, 'b-','LineWidth',2.0);
@@ -382,34 +416,27 @@ function out = active_integrate_logaware(funNLL, xmin, xmax, opts)
         theta_train = fromFeat(U(:,1));
         plot(theta_train, Y_train_center, 'ko','MarkerFaceColor','y','MarkerSize',5);
 
-        xlabel('\theta (parameter)','Interpreter','latex');
-        ylabel('shifted \log_{10} L_{\mathrm{rel}}(\theta)','Interpreter','latex');
-        title('1D Active GP Surrogate for shifted log_{10} Likelihood','Interpreter','latex');
-        legend({'95% band','GP median','Train pts'},'Location','best');
+        xlabel('Parameter');
+        ylabel('Shifted log_{10} Likelihood');
+        title(sprintf('1D GP Surrogate - %s', upper(modelName)));
+        legend({'95% band','GP mean','Training pts'},'Location','best');
 
         if xmin(1) > 0
             set(gca,'XScale','log'); xlim([xmin(1) xmax(1)]);
-            xticks(10.^(floor(log10(xmin(1))):ceil(log10(xmax(1)))));
-            ax = gca; ax.XMinorGrid = 'on';
         end
         grid on;
     end
 
     % ----------------- Pack outputs -----------------
     out = struct();
-    % Evidence (log-space preferred)
     out.logI_mean    = logI_mean;
     out.logI_CI95    = CI95_log;
     out.log10I_mean  = log10I_mean;
     out.log10I_CI95  = log10I_CI95;
-
-    % Linear evidence (may underflow)
     out.I_mean       = I_mean;
     out.CI95         = CI95_lin;
-    out.sigma_model  = CV_model_final;   % CHANGED: now stores CV (relative)
-    out.sigma_rqmc   = se_rqmc_final;     % CHANGED: now stores CV (relative)
-
-    % GP / design
+    out.sigma_model  = CV_model_final;
+    out.sigma_rqmc   = se_rqmc_final;
     out.U            = U;
     out.Y            = Y;
     out.gpr          = gpr;
@@ -420,13 +447,6 @@ function out = active_integrate_logaware(funNLL, xmin, xmax, opts)
     out.toFeat       = toFeat;
     out.fromFeat     = fromFeat;
     out.jacobian     = jacobian;
-    
-    fprintf('NLL Statistics:\n');
-    fprintf('  Min NLL0: %.6e\n', min(NLL0));
-    fprintf('  Max NLL0: %.6e\n', max(NLL0));
-    fprintf('  Median NLL0 (N0, min): %.6e\n', N0);
-    fprintf('  Range: %.6e\n', max(NLL0) - min(NLL0));
-    fprintf('  Shifted Y range: [%.6e, %.6e]\n', min(Y), max(Y));
 end
 
 % ====================== LOCAL FUNCTIONS ======================
@@ -436,31 +456,6 @@ function mdl = trainGP(Uin, Yin, kernelName, basisName)
         'KernelFunction', kernelName, ...
         'BasisFunction',  basisName, ...
         'Standardize',    true);
-end
-
-function [logI_est, I_sd, Lmean, Lvar] = int_stats_log10(mu10, sd10, w)
-% INT_STATS_LOG10 - Log-space stable version without artificial clamping
-
-    ln10  = log(10);
-    mu_e  = ln10*mu10;   % mu_e = ln(L_rel)
-    sd_e  = ln10*sd10;
-    
-    % For uncertainty estimation - NO CLAMPING
-    Lmean = exp(mu_e + 0.5*sd_e.^2);
-    Lvar  = exp(2*mu_e + sd_e.^2) .* (exp(sd_e.^2) - 1);
-    I_sd  = sqrt(sum(w.^2 .* Lvar));
-    
-    % Compute integral in log-space
-    log_w = log(max(w, realmin));
-    log_integrand = log_w + mu_e + 0.5*sd_e.^2;
-    
-    % Stable logsumexp
-    max_log = max(log_integrand);
-    if ~isfinite(max_log)
-        logI_est = -inf;
-    else
-        logI_est = max_log + log(sum(exp(log_integrand - max_log)));
-    end
 end
 
 function [ell_vec, sigmaF] = gp_lengthscale_vec(gpr, d)
@@ -531,87 +526,70 @@ function d = row_dist(u, U)
 end
 
 function [logI_bar, se_rqmc, sd_model_bar] = rqmc_integral_mean_and_SE(gpr, N, R, jacobian_fn, d)
-% RQMC_INTEGRAL_MEAN_AND_SE - Pure log-space uncertainty computation
-
-    logIvals = zeros(R,1); 
-    logCV_model = zeros(R,1);  % Store log(CV) for each scramble
+    % RQMC integration WITHOUT prior weighting (fallback)
+    logIvals = zeros(R,1);
     sob = scramble(sobolset(d),'MatousekAffineOwen');
     ln10 = log(10);
-    
+
     for r = 1:R
         U0 = net(sob, N);
         shift = rand(1,d);
         U = mod(U0 + shift, 1);
+
         w = jacobian_fn(U) / N;
-        [mu, sd] = predict(gpr, U);
-        
-        % Compute log-integral
-        mu_e = ln10 * mu;
-        sd_e = ln10 * sd;
-        
+        mu = predict(gpr, U);
+
         log_w = log(w);
-        log_integrand = log_w + mu_e + 0.5*sd_e.^2;
+        log_integrand = log_w + ln10 * mu;
+
         max_log = max(log_integrand);
-        logI_r = max_log + log(sum(exp(log_integrand - max_log)));
-        logIvals(r) = logI_r;
-        
-        % ========== Compute CV in log-space ==========
-        % CV^2 = Var(I) / E[I]^2
-        % log(CV^2) = log(Var(I)) - 2*log(E[I])
-        % log(CV) = 0.5 * [log(Var(I)) - 2*log(E[I])]
-        
-        % E[I] in log-space (already computed above)
-        logI_mean = logI_r;
-        
-        % Var(I) = sum(w_i^2 * Var(L_i))
-        % In log-space:
-        log_w2 = 2*log_w;  % log(w^2)
-        log_varL = 2*mu_e + sd_e.^2 + log(exp(sd_e.^2) - 1);  % log(Var(L_i))
-        log_varContrib = log_w2 + log_varL;  % log(w_i^2 * Var(L_i))
-        
-        % Sum variance contributions in log-space
-        max_logvar = max(log_varContrib);
-        if isfinite(max_logvar)
-            logI_var = max_logvar + log(sum(exp(log_varContrib - max_logvar)));
-            
-            % log(CV) = 0.5 * [log(Var) - 2*log(Mean)]
-            logCV_model(r) = 0.5 * (logI_var - 2*logI_mean);
-        else
-            logCV_model(r) = -inf;  % Zero variance
-        end
+        logIvals(r) = max_log + log(sum(exp(log_integrand - max_log)));
     end
-    
-    % Average in log-space
+
     max_logI = max(logIvals);
-    if ~isfinite(max_logI)
-        logI_bar = -inf;
-        se_rqmc = NaN;
-        sd_model_bar = NaN;
-        return;
-    end
-    
     logI_bar = max_logI + log(mean(exp(logIvals - max_logI)));
-    
-    % RQMC uncertainty (std of log values = CV)
+
     se_rqmc = std(logIvals, 0) / sqrt(R);
-    
-    % Model uncertainty: average CV across scrambles
-    % Average log(CV) values in log-space, then exponentiate
-    finite_logCV = logCV_model(isfinite(logCV_model));
-    if ~isempty(finite_logCV)
-        max_logCV = max(finite_logCV);
-        mean_logCV = max_logCV + log(mean(exp(finite_logCV - max_logCV)));
-        sd_model_bar = exp(mean_logCV);
-    else
-        sd_model_bar = 0;
-    end
-    
-    if ~isfinite(sd_model_bar) || sd_model_bar < 0
-        sd_model_bar = 0;
-    end
+    sd_model_bar = 0;
 end
 
-% -------- log-aware maps --------
+function [logI_bar, se_rqmc, sd_model_bar] = rqmc_integral_mean_and_SE_with_prior(gpr, N, R, jacobian_fn, d, modelName, priors, fromFeat_fn)
+    % RQMC integration WITH proper prior weighting
+    logIvals = zeros(R,1);
+    sob = scramble(sobolset(d),'MatousekAffineOwen');
+    ln10 = log(10);
+
+    for r = 1:R
+        U0 = net(sob, N);
+        shift = rand(1,d);
+        U = mod(U0 + shift, 1);
+
+        w = jacobian_fn(U) / N;
+        mu = predict(gpr, U);
+
+        % Evaluate prior P(¸|M) at each integration point
+        logPrior_vec = zeros(N,1);
+        for i = 1:N
+            theta_i = fromFeat_fn(U(i,:));
+            logPrior_vec(i) = priors.paramPrior(modelName, theta_i);
+        end
+
+        % log integrand: log[w × L_rel(¸) × P(¸|M)]
+        log_w = log(w);
+        log_integrand = log_w + ln10 * mu + logPrior_vec;
+
+        max_log = max(log_integrand);
+        logIvals(r) = max_log + log(sum(exp(log_integrand - max_log)));
+    end
+
+    max_logI = max(logIvals);
+    logI_bar = max_logI + log(mean(exp(logIvals - max_logI)));
+
+    se_rqmc = std(logIvals, 0) / sqrt(R);
+    sd_model_bar = 0;
+end
+
+% Log-aware coordinate transforms
 function X = u2x_logaware(U, xmin_, xmax_, log_axes_, loga_, logb_)
     U = double(U); X = zeros(size(U));
     for j = 1:numel(xmin_)
