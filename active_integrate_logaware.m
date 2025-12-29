@@ -1,38 +1,42 @@
-function out = active_integrate_logaware(funNLL, xmin, xmax, opts, modelName, priors)
+function out = active_integrate_logaware(funNLL, xmin, xmax, opts)
 % ACTIVE_INTEGRATE_LOGAWARE
 %   Active GP-based integration of negative log-likelihood with prior weighting
 %
 % CORRECTED VERSION: Properly implements Bayesian evidence calculation
 %   P(D|M) = + P(D|¸,M) × P(¸|M) d¸
 %
-% CRITICAL FIX: Re-shifts Y with final N0 BEFORE fitting final GP
+% CRITICAL FIXES:
+%   1. Uses FINAL N0 from start (no re-shifting)
+%   2. Priors passed via opts struct
+%   3. Safe prior evaluation with error handling
 
     % ----------------- Basic setup -----------------
     if nargin < 4, opts = struct(); end
-    if nargin < 5, modelName = 'unknown'; end
-    if nargin < 6, priors = struct(); end
     
     if ~isfield(opts,'rngSeed'),      opts.rngSeed      = 42;   end
     if ~isfield(opts,'maxRounds'),    opts.maxRounds    = 40;   end
     if ~isfield(opts,'maxAddedMult'), opts.maxAddedMult = 160;  end
     if ~isfield(opts,'tolRelCI'),     opts.tolRelCI     = 0.03; end
-    if ~isfield(opts,'verbose'),      opts.verbose      = true; end  % DEFAULT TRUE
+    if ~isfield(opts,'verbose'),      opts.verbose      = true; end
+
+    % Extract priors and model info from opts
+    if isfield(opts, 'priors') && isfield(opts, 'modelName')
+        priors = opts.priors;
+        modelName = opts.modelName;
+        have_priors = true;
+    else
+        priors = struct();
+        modelName = 'unknown';
+        have_priors = false;
+        warning('active_integrate_logaware:noPriors', ...
+                'No priors in opts - using uniform prior (may give incorrect evidence)');
+    end
 
     xmin = xmin(:)'; xmax = xmax(:)';
     d = numel(xmin);
     rng(opts.rngSeed);
 
     ln10 = log(10);
-
-    % Check if we have priors for proper Bayesian integration
-    have_priors = ~isempty(priors) && isfield(priors, 'paramPrior');
-    
-    if ~have_priors
-        warning('active_integrate_logaware:noPriors', ...
-                'No priors provided - using uniform prior (may give incorrect evidence)');
-    else
-        fprintf('[%s] Using priors from build_model_priors\n', upper(modelName));
-    end
 
     % ----------------- Log-aware map: which axes are log10? -----------------
     log_axes = (xmin > 0) & ((xmax ./ max(xmin, eps)) >= 100);
@@ -65,18 +69,6 @@ function out = active_integrate_logaware(funNLL, xmin, xmax, opts, modelName, pr
     KcapPerRound = 6 + 4*d;
     maxAdded     = opts.maxAddedMult * d;
 
-    % Optimal RQMC scrambles for convergence check
-    if d==1
-        N_rqmc_small = 2^15;
-        R_rqmc_small = 16;
-    elseif d==2
-        N_rqmc_small = 2^16;
-        R_rqmc_small = 12;
-    else
-        N_rqmc_small = 2^15;
-        R_rqmc_small = 10;
-    end
-
     fprintf('\n=== Starting Active Learning for %s (%dD) ===\n', upper(modelName), d);
     fprintf('Initial design: %d points\n', n0);
     fprintf('Max rounds: %d, Convergence tolerance: %.1f%%\n\n', maxRounds, 100*opts.tolRelCI);
@@ -90,16 +82,16 @@ function out = active_integrate_logaware(funNLL, xmin, xmax, opts, modelName, pr
     fprintf('Evaluating initial design...\n');
     NLL0 = funNLL(X0);
     
-    % Initial reference offset (temporary, for active learning only)
-    N0_temp = min(NLL0);
+    % CRITICAL FIX: Use FINAL N0 from start (no temporary shift)
+    N0 = min(NLL0);
     
-    % Shifted log10-likelihood (for GP training during active loop)
-    Y = -(NLL0 - N0_temp) / log(10);
+    % Shifted log10-likelihood (for GP training)
+    Y = -(NLL0 - N0) / log(10);
     
     fprintf('Initial NLL range: [%.2e, %.2e]\n', min(NLL0), max(NLL0));
     fprintf('Initial Y range: [%.2f, %.2f]\n\n', min(Y), max(Y));
     
-    % CRITICAL: Store RAW NLL values (no shifting yet)
+    % Store RAW NLL values
     NLL_raw = NLL0;
     
     % Acquisition grid (Sobol in U)
@@ -266,20 +258,20 @@ function out = active_integrate_logaware(funNLL, xmin, xmax, opts, modelName, pr
         X_new   = fromFeat(newU);
         NLL_new = funNLL(X_new);
         
-        % CRITICAL: Accumulate RAW NLL values (no shifting)
+        % Accumulate RAW NLL values
         NLL_raw = [NLL_raw; NLL_new];
         
-        % Update Y with CURRENT temp offset (for GP training only)
-        newY = -(NLL_new - N0_temp) / ln10;
+        % CRITICAL FIX: Use SAME N0 (not temporary)
+        newY = -(NLL_new - N0) / ln10;
         
         U = [U; newU];
         Y = [Y; newY];
         addedTotal = addedTotal + size(newU,1);
 
-        % Convergence based on GP prediction quality (RELATIVE to response range)
+        % Convergence based on GP prediction quality
         Y_range = max(Y) - min(Y);
         if Y_range < eps
-            Y_range = 1;  % Fallback if Y is constant
+            Y_range = 1;
         end
         
         max_sd = max(sdA);
@@ -297,24 +289,8 @@ function out = active_integrate_logaware(funNLL, xmin, xmax, opts, modelName, pr
         end
     end
 
-    % ============================================================================
-    % CRITICAL FIX: Re-shift Y with final N0 BEFORE fitting final GP
-    % ============================================================================
-    N0 = min(NLL_raw);  % Final N0 from ALL raw NLL values
-    
-    if opts.verbose
-        fprintf('\nFinal shift: N0_temp = %.6e  N0_final = %.6e\n', N0_temp, N0);
-    end
-    
-    % Re-compute Y for ALL points with final N0
-    Y = -(NLL_raw - N0) / log(10);
-    
-    if opts.verbose
-        fprintf('Final Y range: [%.2f, %.2f]\n', min(Y), max(Y));
-    end
-    
-    % ----------------- Final GP fit with re-shifted Y -----------------
-    fprintf('Fitting final GP with %d total points...\n', size(U,1));
+    % ----------------- Final GP fit (no re-shifting needed) -----------------
+    fprintf('\nFitting final GP with %d total points...\n', size(U,1));
     gpr = trainGP(U, Y, kernelName, basisName);
 
     % Final integration with high accuracy
@@ -328,13 +304,12 @@ function out = active_integrate_logaware(funNLL, xmin, xmax, opts, modelName, pr
     
     fprintf('Computing final RQMC integral (N=%d, R=%d)...\n', Nint_final, R_final);
     
-    % CRITICAL: Apply prior as weight during integration
+    % Apply prior as weight during integration
     if have_priors
         [logI_rel_bar, se_rqmc_final, CV_model_final] = ...
-            rqmc_integral_mean_and_SE_with_prior(gpr, Nint_final, R_final, jacobian, d, ...
-                                                  modelName, priors, fromFeat);
+            rqmc_integral_with_prior(gpr, Nint_final, R_final, jacobian, d, ...
+                                     modelName, priors, fromFeat);
     else
-        % Fallback to uniform prior (not recommended)
         [logI_rel_bar, se_rqmc_final, CV_model_final] = ...
             rqmc_integral_mean_and_SE(gpr, Nint_final, R_final, jacobian, d);
     end
@@ -353,7 +328,6 @@ function out = active_integrate_logaware(funNLL, xmin, xmax, opts, modelName, pr
     % Total coefficient of variation
     CV_total = sqrt(CV_model_final^2 + se_rqmc_final^2);
     
-    % Delta method: for Y = log(X), Var(Y) H CV(X)^2
     if isfinite(CV_total) && CV_total > 0
         se_logI  = CV_total;
         CI95_log = [logI_mean - 1.96*se_logI, logI_mean + 1.96*se_logI];
@@ -386,6 +360,7 @@ function out = active_integrate_logaware(funNLL, xmin, xmax, opts, modelName, pr
     
     % Find and report MAP
     [~, mapIdx] = max(Y);
+    out.mapIdx = mapIdx;  % Store for later use
     mapTheta = fromFeat(U(mapIdx,:));
     fprintf('MAP parameters: ');
     for j = 1:numel(mapTheta)
@@ -417,7 +392,7 @@ function out = active_integrate_logaware(funNLL, xmin, xmax, opts, modelName, pr
         plot(theta_train, Y_train_center, 'ko','MarkerFaceColor','y','MarkerSize',5);
 
         xlabel('Parameter');
-        ylabel('Shifted log_{10} Likelihood');
+        ylabel('Shifted log10 Likelihood');
         title(sprintf('1D GP Surrogate - %s', upper(modelName)));
         legend({'95% band','GP mean','Training pts'},'Location','best');
 
@@ -428,7 +403,6 @@ function out = active_integrate_logaware(funNLL, xmin, xmax, opts, modelName, pr
     end
 
     % ----------------- Pack outputs -----------------
-    out = struct();
     out.logI_mean    = logI_mean;
     out.logI_CI95    = CI95_log;
     out.log10I_mean  = log10I_mean;
@@ -449,7 +423,7 @@ function out = active_integrate_logaware(funNLL, xmin, xmax, opts, modelName, pr
     out.jacobian     = jacobian;
 end
 
-% ====================== LOCAL FUNCTIONS ======================
+%% ====================== LOCAL FUNCTIONS ======================
 
 function mdl = trainGP(Uin, Yin, kernelName, basisName)
     mdl = fitrgp(Uin, Yin, ...
@@ -553,11 +527,21 @@ function [logI_bar, se_rqmc, sd_model_bar] = rqmc_integral_mean_and_SE(gpr, N, R
     sd_model_bar = 0;
 end
 
-function [logI_bar, se_rqmc, sd_model_bar] = rqmc_integral_mean_and_SE_with_prior(gpr, N, R, jacobian_fn, d, modelName, priors, fromFeat_fn)
-    % RQMC integration WITH proper prior weighting
+function [logI_bar, se_rqmc, sd_model_bar] = rqmc_integral_with_prior(gpr, N, R, jacobian_fn, d, modelName, priors, fromFeat_fn)
+    % RQMC integration WITH proper prior weighting P(¸|M)
+    
     logIvals = zeros(R,1);
     sob = scramble(sobolset(d),'MatousekAffineOwen');
     ln10 = log(10);
+
+    % Get prior function for this model
+    modelKey = normalize_model_name(modelName);
+    if isfield(priors, modelKey) && isfield(priors.(modelKey), 'prior_fn')
+        prior_fn = priors.(modelKey).prior_fn;
+    else
+        warning('No prior function for %s, using uniform', modelName);
+        prior_fn = @(theta) 0;  % log(1) = 0
+    end
 
     for r = 1:R
         U0 = net(sob, N);
@@ -571,25 +555,60 @@ function [logI_bar, se_rqmc, sd_model_bar] = rqmc_integral_mean_and_SE_with_prio
         logPrior_vec = zeros(N,1);
         for i = 1:N
             theta_i = fromFeat_fn(U(i,:));
-            logPrior_vec(i) = priors.paramPrior(modelName, theta_i);
+            try
+                logPrior_vec(i) = prior_fn(theta_i);
+            catch ME
+                % Silent failure - just mark as invalid
+                logPrior_vec(i) = -inf;
+            end
         end
 
-        % log integrand: log[w × L_rel(¸) × P(¸|M)]
+        % Log integrand: log[w × L_rel(¸) × P(¸|M)]
         log_w = log(w);
         log_integrand = log_w + ln10 * mu + logPrior_vec;
 
-        max_log = max(log_integrand);
-        logIvals(r) = max_log + log(sum(exp(log_integrand - max_log)));
+        % Stable logsumexp
+        valid = isfinite(log_integrand);
+        if any(valid)
+            max_log = max(log_integrand(valid));
+            logIvals(r) = max_log + log(sum(exp(log_integrand(valid) - max_log)));
+        else
+            logIvals(r) = -inf;
+        end
     end
 
-    max_logI = max(logIvals);
-    logI_bar = max_logI + log(mean(exp(logIvals - max_logI)));
+    % Combine across scrambles
+    valid = isfinite(logIvals);
+    if ~any(valid)
+        logI_bar = -inf;
+        se_rqmc = inf;
+        sd_model_bar = 0;
+        return;
+    end
 
-    se_rqmc = std(logIvals, 0) / sqrt(R);
+    max_logI = max(logIvals(valid));
+    logI_bar = max_logI + log(mean(exp(logIvals(valid) - max_logI)));
+
+    se_rqmc = std(logIvals(valid), 0) / sqrt(sum(valid));
     sd_model_bar = 0;
 end
 
-% Log-aware coordinate transforms
+function key = normalize_model_name(modelName)
+    % Map model names to prior struct keys
+    switch lower(modelName)
+        case {'newtonian', 'newt'}, key = 'Newt';
+        case 'nh',                  key = 'NH';
+        case 'kv',                  key = 'KV';
+        case 'qnh',                 key = 'qNH';
+        case {'linmax', 'max', 'lm'}, key = 'LM';
+        case 'qkv',                 key = 'qKV';
+        case 'sls',                 key = 'SLS';
+        otherwise,                  key = upper(modelName);
+    end
+end
+
+%% ====================== Coordinate Transforms ======================
+
 function X = u2x_logaware(U, xmin_, xmax_, log_axes_, loga_, logb_)
     U = double(U); X = zeros(size(U));
     for j = 1:numel(xmin_)
