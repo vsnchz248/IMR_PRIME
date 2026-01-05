@@ -8,9 +8,9 @@ synthetic = 'synthetic_data.mat';
 % if everything off, collapse must be off in function at bottom
 radial = 2;
 stress = 1; % 1: models 1,2,3; 2: models 4,6; 3: models 5,7
-bubtherm = 1;
+bubtherm = 0;
 medtherm = 0;
-masstrans = 1;
+masstrans = 0;
 vapor = 1;
 Nt = 100;
 Mt = 100;

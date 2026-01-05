@@ -1,14 +1,11 @@
 function out = active_integrate_logaware(funNLL, xmin, xmax, opts)
 % ACTIVE_INTEGRATE_LOGAWARE
-%   Active GP-based integration of negative log-likelihood with prior weighting
+%   Active GP-based integration with PROPER beta marginalization per BIMR
 %
-% CORRECTED VERSION: Properly implements Bayesian evidence calculation
-%   P(D|M) = + P(D|¸,M) × P(¸|M) d¸
-%
-% CRITICAL FIXES:
-%   1. Uses FINAL N0 from start (no re-shifting)
-%   2. Priors passed via opts struct
-%   3. Safe prior evaluation with error handling
+% CORRECTED VERSION: Matches BIMR paper exactly
+%   1. For each θ: Marginalize β first -> P(D|M,θ)
+%   2. Train GP on -log P(D|M,θ)  
+%   3. Integrate: P(D|M) = ∫ P(D|M,θ) P(θ|M) dθ
 
     % ----------------- Basic setup -----------------
     if nargin < 4, opts = struct(); end
@@ -38,7 +35,17 @@ function out = active_integrate_logaware(funNLL, xmin, xmax, opts)
 
     ln10 = log(10);
 
-    % ----------------- Log-aware map: which axes are log10? -----------------
+    % ----------------- Beta grid for marginalization (BIMR Eq. 15-17) -----------------
+    beta_min = 0.05;
+    beta_max = 10.0;
+    N_beta = 100;
+    beta_grid = linspace(beta_min, beta_max, N_beta);
+    
+    % Half-Cauchy prior P(β) = (2/π) × 1/(1+β²)
+    P_beta = (2/pi) ./ (1 + beta_grid.^2);
+    P_beta = P_beta / sum(P_beta);  % Normalize for discrete approximation
+
+    % ----------------- Log-aware map -----------------
     log_axes = (xmin > 0) & ((xmax ./ max(xmin, eps)) >= 100);
 
     loga = zeros(1,d); logb = zeros(1,d); dx_du_lin = zeros(1,d);
@@ -51,7 +58,6 @@ function out = active_integrate_logaware(funNLL, xmin, xmax, opts)
         end
     end
 
-    % Maps and Jacobian
     fromFeat = @(U) u2x_logaware(U, xmin, xmax, log_axes, loga, logb);
     toFeat   = @(X) x2u_logaware(X, xmin, xmax, log_axes, loga, logb);
     jacobian = @(U) jac_logaware(U, xmin, xmax, log_axes, loga, logb, dx_du_lin);
@@ -78,28 +84,56 @@ function out = active_integrate_logaware(funNLL, xmin, xmax, opts)
     U    = net(sob0, n0);
     X0   = fromFeat(U);
 
-    % Evaluate raw negative log-likelihood (natural log)
-    fprintf('Evaluating initial design...\n');
-    NLL0 = funNLL(X0);
+    % Evaluate NLL for ALL beta values
+    fprintf('Evaluating initial design with beta marginalization...\n');
+    NLL_beta = funNLL(X0, beta_grid);  % Returns [n0 × N_beta] matrix
     
-    % CRITICAL FIX: Use FINAL N0 from start (no temporary shift)
-    N0 = min(NLL0);
+    % DEBUG: Check NLL values
+    fprintf('NLL_beta stats:\n');
+    fprintf('  min(NLL_beta) = %.6f\n', min(NLL_beta(:)));
+    fprintf('  max(NLL_beta) = %.6f\n', max(NLL_beta(:)));
+    fprintf('  mean(NLL_beta) = %.6f\n', mean(NLL_beta(:)));
+    fprintf('  median(NLL_beta) = %.6f\n', median(NLL_beta(:)));
+    fprintf('  Any negative? %d\n', any(NLL_beta(:) < 0));
+    fprintf('  Any < -100? %d\n', any(NLL_beta(:) < -100));
+    fprintf('  Number of very negative (< -1000): %d\n', sum(NLL_beta(:) < -1000));
     
-    % Shifted log10-likelihood (for GP training)
-    Y = -(NLL0 - N0) / log(10);
+    % Marginalize beta for each theta (BIMR Eq. 17)
+    % P(D|M,θ) = Σ_b P(D|M,θ,β_b) P(β_b)
+    % In log space: log P(D|M,θ) = logsumexp_b[-NLL(θ,β_b) + log P(β_b)]
+    log_P_D_given_theta = zeros(n0, 1);
+    best_beta_idx = zeros(n0, 1);
+    for i = 1:n0
+        log_terms = -NLL_beta(i,:) + log(P_beta);
+        [~, best_beta_idx(i)] = max(log_terms);
+        max_log = max(log_terms);
+        log_P_D_given_theta(i) = max_log + log(sum(exp(log_terms - max_log)));
+    end
     
-    fprintf('Initial NLL range: [%.2e, %.2e]\n', min(NLL0), max(NLL0));
-    fprintf('Initial Y range: [%.2f, %.2f]\n\n', min(Y), max(Y));
+    % DEBUG: Show preferred beta values
+    fprintf('Preferred beta values:\n');
+    fprintf('  Most common beta index: %d (beta=%.3f)\n', ...
+        mode(best_beta_idx), beta_grid(mode(best_beta_idx)));
+    fprintf('  Beta range of best fits: [%.3f, %.3f]\n', ...
+        min(beta_grid(best_beta_idx)), max(beta_grid(best_beta_idx)));
+    fprintf('  Median best beta: %.3f\n', median(beta_grid(best_beta_idx)));
     
-    % Store RAW NLL values
-    NLL_raw = NLL0;
+    % Target for GP: -log10 P(D|M,θ) with offset for numerical stability
+    N0 = max(log_P_D_given_theta);  % Most likely theta (MAXIMUM log probability)
+    Y = -(log_P_D_given_theta - N0) / ln10;
     
-    % Acquisition grid (Sobol in U)
+    fprintf('Initial -log P(D|M,θ) range: [%.2f, %.2f]\n', min(Y), max(Y));
+    fprintf('N0 (reference log P): %.6e\n', N0);
+    fprintf('Best fit: log P(D|M,θ_best) = %.6e\n', N0);
+    fprintf('Worst fit: log P(D|M,θ_worst) = %.6e\n', min(log_P_D_given_theta));
+    fprintf('Y statistics: mean=%.2f, std=%.2f, max=%.2f\n\n', mean(Y), std(Y), max(Y));
+
+    % Acquisition grid
     sobA = scramble(sobolset(d),'MatousekAffineOwen');
     Uacq = net(sobA, Nacq);
     wA   = jacobian(Uacq) / Nacq;
 
-    % Final report grid (for 1D plots if d==1)
+    % Final integration grid
     sobF       = scramble(sobolset(d),'MatousekAffineOwen');
     Uint_final = net(sobF, Nint_final);
 
@@ -129,18 +163,13 @@ function out = active_integrate_logaware(funNLL, xmin, xmax, opts)
         % Posterior on acquisition grid
         [muA, sdA] = predict(gpr, Uacq);
         sdA = max(sdA, 1e-9);
-        mu_e = ln10 * muA;
-        sd_e = ln10 * sdA;
 
-        % Log-normal mean/var of L_rel
-        LmeanA = exp(mu_e + 0.5*sd_e.^2);
-        LvarA  = exp(2*mu_e + sd_e.^2) .* (exp(sd_e.^2) - 1);
+        % Expected integrand variance
+        A_var = (wA.^2) .* (sdA.^2);
 
-        % Var(I_rel) contributions
-        A_var = (wA.^2) .* LvarA;
-
-        % Mass concentration tempering exponent gamma
+        % Mass concentration for tempering
         kTop = max(1, round(0.01 * Nacq));
+        LmeanA = exp(-ln10 * muA);  % Convert back to P(D|M,θ) scale
         Lw_sorted = sort(LmeanA .* wA, 'descend');
         shareTop  = sum(Lw_sorted(1:kTop)) / max(sum(Lw_sorted), eps);
         C = min(1, max(0, (shareTop - 0.01) / (0.60 - 0.01)));
@@ -186,7 +215,7 @@ function out = active_integrate_logaware(funNLL, xmin, xmax, opts)
         end
         qLocal = min(KcapPerRound-3, max(1, qBase + round(3*C) + (d==3)*2));
 
-        [~, iMAP] = max(LmeanA);
+        [~, iMAP] = min(muA);  % min of -log10 P = max of P
         u0 = Uacq(iMAP,:);
         localCands = u0;
         [~, ax] = sort(ell_vec, 'descend'); maxAxes = min(d,2);
@@ -200,7 +229,7 @@ function out = active_integrate_logaware(funNLL, xmin, xmax, opts)
             localCands = [localCands; u_plus; u_minus]; %#ok<AGROW>
         end
 
-        % Diagonals in top 2 axes
+        % Diagonals
         if d >= 2
             a1 = ax(1); a2 = ax(min(2,d));
             for s1 = [-1,1]
@@ -221,7 +250,7 @@ function out = active_integrate_logaware(funNLL, xmin, xmax, opts)
         qLocal = min(qLocal, size(localU,1));
         localU = localU(1:qLocal,:);
 
-        % Diversified batch for remaining slots
+        % Diversified batch
         Krem = max(0, KcapPerRound - qLocal - 1);
         if d==3,      M = min(12000, Nacq);
         elseif d==2,  M = min(8000,  Nacq);
@@ -239,7 +268,7 @@ function out = active_integrate_logaware(funNLL, xmin, xmax, opts)
             if ~isempty(newUdiv), break; end
         end
 
-        % Tiny global refresh
+        % Global refresh
         Kglob = max(0, KcapPerRound - size(localU,1) - size(newUdiv,1));
         newUglob = [];
         if Kglob > 0
@@ -254,25 +283,32 @@ function out = active_integrate_logaware(funNLL, xmin, xmax, opts)
             break;
         end
 
-        % Deterministic oracle calls
-        X_new   = fromFeat(newU);
-        NLL_new = funNLL(X_new);
+        % Evaluate and marginalize beta
+        X_new = fromFeat(newU);
+        NLL_beta_new = funNLL(X_new, beta_grid);
         
-        % Accumulate RAW NLL values
-        NLL_raw = [NLL_raw; NLL_new];
+        log_P_D_given_theta_new = zeros(size(newU,1), 1);
+        for i = 1:size(newU,1)
+            log_terms = -NLL_beta_new(i,:) + log(P_beta);
+            max_log = max(log_terms);
+            log_P_D_given_theta_new(i) = max_log + log(sum(exp(log_terms - max_log)));
+        end
         
-        % CRITICAL FIX: Use SAME N0 (not temporary)
-        newY = -(NLL_new - N0) / ln10;
+        newY = -(log_P_D_given_theta_new - N0) / ln10;
         
         U = [U; newU];
         Y = [Y; newY];
         addedTotal = addedTotal + size(newU,1);
-
-        % Convergence based on GP prediction quality
-        Y_range = max(Y) - min(Y);
-        if Y_range < eps
-            Y_range = 1;
+        
+        % DEBUG: Track Y statistics
+        if mod(rounds, 5) == 0
+            fprintf('  [DEBUG] Y stats after round %d: min=%.2f, max=%.2f, mean=%.2f, std=%.2f\n', ...
+                rounds, min(Y), max(Y), mean(Y), std(Y));
         end
+
+        % Convergence
+        Y_range = max(Y) - min(Y);
+        if Y_range < eps, Y_range = 1; end
         
         max_sd = max(sdA);
         mean_sd = mean(sdA);
@@ -282,29 +318,25 @@ function out = active_integrate_logaware(funNLL, xmin, xmax, opts)
         fprintf('Round %2d: added %2d pts | Max GP std: %.2f%%, Mean GP std: %.2f%% | Total pts: %d\n', ...
                 rounds, size(newU,1), 100*max_sd_rel, 100*mean_sd_rel, size(U,1));
 
-        % Convergence: GP relative uncertainty < 5%
         if max_sd_rel < 0.05
             fprintf('Stop: GP sufficiently accurate (max_sd < 5%% of Y range)\n');
             break;
         end
     end
 
-    % ----------------- Final GP fit (no re-shifting needed) -----------------
+    % ----------------- Final GP fit -----------------
     fprintf('\nFitting final GP with %d total points...\n', size(U,1));
     gpr = trainGP(U, Y, kernelName, basisName);
 
     % Final integration with high accuracy
-    if d==1
-        R_final = 32;
-    elseif d==2
-        R_final = 16;
-    else
-        R_final = 12;
+    if d==1, R_final = 32;
+    elseif d==2, R_final = 16;
+    else, R_final = 12;
     end
     
     fprintf('Computing final RQMC integral (N=%d, R=%d)...\n', Nint_final, R_final);
     
-    % Apply prior as weight during integration
+    % Integrate with prior: ∫ P(D|M,θ) P(θ|M) dθ
     if have_priors
         [logI_rel_bar, se_rqmc_final, CV_model_final] = ...
             rqmc_integral_with_prior(gpr, Nint_final, R_final, jacobian, d, ...
@@ -314,14 +346,15 @@ function out = active_integrate_logaware(funNLL, xmin, xmax, opts)
             rqmc_integral_mean_and_SE(gpr, Nint_final, R_final, jacobian, d);
     end
     
-    % True log evidence
-    logI_mean = -N0 + logI_rel_bar;
+    % True log evidence: log P(D|M) = N0 + logI_rel
+    logI_mean = N0 + logI_rel_bar;
     
     if opts.verbose
         fprintf('\n=== Evidence Calculation ===\n');
         fprintf('N0 (reference): %.6e\n', N0);
         fprintf('logI_rel: %.6e\n', logI_rel_bar);
-        fprintf('logI_mean = -N0 + logI_rel = %.6e\n', logI_mean);
+        fprintf('logI_mean = N0 + logI_rel = %.6e\n', logI_mean);
+        fprintf('log10(evidence) = %.6f\n', logI_mean / ln10);
         fprintf('===========================\n\n');
     end
     
@@ -355,12 +388,12 @@ function out = active_integrate_logaware(funNLL, xmin, xmax, opts)
 
     fprintf('\n=== FINAL RESULTS for %s ===\n', upper(modelName));
     fprintf('Total points: %d (added %d in %d rounds)\n', size(U,1), addedTotal, rounds);
-    fprintf('log10(Z) H %.6g  (95%% CI: [%.6g, %.6g])\n', ...
+    fprintf('log10(Z) = %.6g  (95%% CI: [%.6g, %.6g])\n', ...
             log10I_mean, log10I_CI95(1), log10I_CI95(2));
     
     % Find and report MAP
-    [~, mapIdx] = max(Y);
-    out.mapIdx = mapIdx;  % Store for later use
+    [~, mapIdx] = min(Y);  % min of -log10 P = max of P
+    out.mapIdx = mapIdx;
     mapTheta = fromFeat(U(mapIdx,:));
     fprintf('MAP parameters: ');
     for j = 1:numel(mapTheta)
@@ -372,8 +405,8 @@ function out = active_integrate_logaware(funNLL, xmin, xmax, opts)
     % Optional 1D plot
     if d==1 && opts.verbose
         [muF_plot, sdF_plot] = predict(gpr, Uint_final);
-        muF_plot = muF_plot - max(muF_plot);
-        Y_train_center = Y - max(Y);
+        muF_plot = muF_plot - min(muF_plot);  % Center around MAP
+        Y_train_center = Y - min(Y);
 
         xF = fromFeat(Uint_final(:,1));
         [xF, ix] = sort(xF); muF_plot = muF_plot(ix); sdF_plot = sdF_plot(ix);
@@ -392,7 +425,7 @@ function out = active_integrate_logaware(funNLL, xmin, xmax, opts)
         plot(theta_train, Y_train_center, 'ko','MarkerFaceColor','y','MarkerSize',5);
 
         xlabel('Parameter');
-        ylabel('Shifted log10 Likelihood');
+        ylabel('-log10 P(D|M,\theta) (shifted)');
         title(sprintf('1D GP Surrogate - %s', upper(modelName)));
         legend({'95% band','GP mean','Training pts'},'Location','best');
 
@@ -513,8 +546,9 @@ function [logI_bar, se_rqmc, sd_model_bar] = rqmc_integral_mean_and_SE(gpr, N, R
         w = jacobian_fn(U) / N;
         mu = predict(gpr, U);
 
+        % Convert from -log10 P back to P
         log_w = log(w);
-        log_integrand = log_w + ln10 * mu;
+        log_integrand = log_w - ln10 * mu;  % log[w × P(D|M,θ)]
 
         max_log = max(log_integrand);
         logIvals(r) = max_log + log(sum(exp(log_integrand - max_log)));
@@ -528,7 +562,7 @@ function [logI_bar, se_rqmc, sd_model_bar] = rqmc_integral_mean_and_SE(gpr, N, R
 end
 
 function [logI_bar, se_rqmc, sd_model_bar] = rqmc_integral_with_prior(gpr, N, R, jacobian_fn, d, modelName, priors, fromFeat_fn)
-    % RQMC integration WITH proper prior weighting P(¸|M)
+    % RQMC integration WITH proper prior weighting P(θ|M)
     
     logIvals = zeros(R,1);
     sob = scramble(sobolset(d),'MatousekAffineOwen');
@@ -551,21 +585,41 @@ function [logI_bar, se_rqmc, sd_model_bar] = rqmc_integral_with_prior(gpr, N, R,
         w = jacobian_fn(U) / N;
         mu = predict(gpr, U);
 
-        % Evaluate prior P(¸|M) at each integration point
+        % Evaluate prior P(θ|M) at each integration point  
+        % NOTE: The prior_fn returns log of DISCRETE probability P(θ|M)
+        % The jacobian already includes the volume element ΔV(θ)
+        % So: integrand = [P(θ|M) / ΔV] × ΔV × P(D|M,θ) = P(θ|M) × P(D|M,θ)
         logPrior_vec = zeros(N,1);
         for i = 1:N
             theta_i = fromFeat_fn(U(i,:));
             try
                 logPrior_vec(i) = prior_fn(theta_i);
             catch ME
-                % Silent failure - just mark as invalid
                 logPrior_vec(i) = -inf;
             end
         end
 
-        % Log integrand: log[w × L_rel(¸) × P(¸|M)]
+        % Log integrand: log[w × P(D|M,θ) × P(θ|M)]
+        % where w = jacobian / N already includes volume element
         log_w = log(w);
-        log_integrand = log_w + ln10 * mu + logPrior_vec;
+        log_integrand = log_w - ln10 * mu + logPrior_vec;
+        
+        % DEBUG: Check integrand values on first scramble
+        if r == 1
+            fprintf('  [Scramble %d] Integration point stats:\n', r);
+            fprintf('    log_w:         mean=%.2f, range=[%.2f, %.2f]\n', ...
+                mean(log_w), min(log_w), max(log_w));
+            fprintf('    logPrior:      mean=%.2f, range=[%.2f, %.2f]\n', ...
+                mean(logPrior_vec(isfinite(logPrior_vec))), ...
+                min(logPrior_vec(isfinite(logPrior_vec))), ...
+                max(logPrior_vec(isfinite(logPrior_vec))));
+            fprintf('    -ln10*mu:      mean=%.2f, range=[%.2f, %.2f]\n', ...
+                mean(-ln10*mu), min(-ln10*mu), max(-ln10*mu));
+            fprintf('    log_integrand: mean=%.2f, range=[%.2f, %.2f]\n', ...
+                mean(log_integrand(isfinite(log_integrand))), ...
+                min(log_integrand(isfinite(log_integrand))), ...
+                max(log_integrand(isfinite(log_integrand))));
+        end
 
         % Stable logsumexp
         valid = isfinite(log_integrand);
@@ -594,7 +648,6 @@ function [logI_bar, se_rqmc, sd_model_bar] = rqmc_integral_with_prior(gpr, N, R,
 end
 
 function key = normalize_model_name(modelName)
-    % Map model names to prior struct keys
     switch lower(modelName)
         case {'newtonian', 'newt'}, key = 'Newt';
         case 'nh',                  key = 'NH';
