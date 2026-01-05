@@ -1,0 +1,13 @@
+# MATLAB
+*.asv
+
+# Ignore all mat by default
+*.mat
+
+# Keep .mat files inside experiments
+!experiments/
+!experiments/**/*.mat
+
+# Results / outputs
+results*/
+output*/
