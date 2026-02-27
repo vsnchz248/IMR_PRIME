@@ -7,7 +7,7 @@ synthetic = 'synthetic_data.mat';
 
 % if everything off, collapse must be off in function at bottom
 radial = 2;
-stress = 1; % 1: models 1,2,3; 2: models 4,6; 3: models 5,7
+stress = 2; % 1: models 1,2,3; 2: models 4,6; 3: models 5,7
 bubtherm = 0;
 medtherm = 0;
 masstrans = 0;
@@ -21,7 +21,7 @@ alphaval = logspace(-3,1,16);
 
 rho = 1064; % density
 P_inf = 101325; % far field pressure
-param = [0.05 0 0 0]; 
+param = [0.05 10000 0 1]; 
 
 Rmax_range = linspace(Rmax-.1*Rmax_std,Rmax+.1*Rmax_std,32);
 Req_range = Rmax_range./lambda;

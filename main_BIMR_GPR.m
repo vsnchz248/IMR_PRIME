@@ -12,6 +12,8 @@ function results_all = main_BIMR_GPR(material_id, model_name, opts)
 %   - string array: ["newtonian","kv"]
 %   - empty [] or omitted => runs ALL models
 
+t_total_start = tic;
+
 if nargin < 2, model_name = []; end
 if nargin < 3, opts = struct(); end
 
@@ -132,6 +134,8 @@ for m = 1:numel(model_list)
     opts_gpr.tolRelCI  = opts.tolRelCI;
     opts_gpr.verbose   = opts.verbose;
     opts_gpr.rngSeed   = opts.rngSeed;
+    opts_gpr.Nint_final_override = 8192;
+    opts_gpr.R_final_override    = 4;
 
     % Needed for prior + redundancy logic inside active_integrate_logaware
     opts_gpr.priors    = priors;
@@ -174,12 +178,12 @@ for m = 1:numel(model_list)
     results_all.per_model{m} = pm;
 
     % Optional per-model save
-    if isfield(opts,'saveEach') && opts.saveEach
-        savePath_i = sprintf('results_%s_mat%d.mat', model, material_id);
-        results_i = pm; %#ok<NASGU>
-        save(savePath_i, 'results_i');
-        fprintf('  Saved per-model: %s\n', savePath_i);
-    end
+    % if isfield(opts,'saveEach') && opts.saveEach
+    %     savePath_i = sprintf('results_%s_mat%d.mat', model, material_id);
+    %     results_i = pm; %#ok<NASGU>
+    %     save(savePath_i, 'results_i');
+    %     fprintf('  Saved per-model: %s\n', savePath_i);
+    % end
 end
 
 results_all.timing = struct('data', t_data, 'prior', t_prior);
@@ -261,13 +265,14 @@ fprintf('========================================\n');
 fprintf('Timing:\n');
 fprintf('  Data prep:   %.2f s\n', t_data);
 fprintf('  Prior build: %.2f s\n', t_prior);
+fprintf('  Total:       %.2f s\n', toc(t_total_start));
 fprintf('========================================\n\n');
 
 % Save combined (default)
-if opts.saveCombined
-    save(opts.savePath, 'results_all', '-v7.3');
-    fprintf('Saved combined results to: %s\n\n', opts.savePath);
-end
+% if opts.saveCombined
+%     save(opts.savePath, 'results_all', '-v7.3');
+%     fprintf('Saved combined results to: %s\n\n', opts.savePath);
+% end
 
 end
 

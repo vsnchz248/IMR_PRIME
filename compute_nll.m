@@ -72,8 +72,8 @@ n_total_data = 2 * nnz(mask);  % Both R and Rdot observations
 %   - All residuals r ≈ max(data)  [complete mismatch]
 %   - Variance σ² ≈ median(σ0²)    [typical experimental noise]
 
-max_R = max(abs(Rmatrix(mask)));
-max_Rdot = max(abs(Rdotmatrix(mask)));
+max_R = median(abs(Rmatrix(mask)));
+max_Rdot = median(abs(Rdotmatrix(mask)));
 med_var_R = median(sigma0_R(mask).^2);
 med_var_Rdot = median(sigma0_Rdot(mask).^2);
 
@@ -83,22 +83,7 @@ penalty_nll = 0.5 * (n_total_data * max_R^2/med_var_R + ...      % Σ(r_R²/σ_R
                      n_total_data * max_Rdot^2/med_var_Rdot + ...% Σ(r_Rdot²/σ_Rdot²)
                      n_total_data * log(2*pi*med_var_R) + ...    % Σ log(2πσ_R²)
                      n_total_data * log(2*pi*med_var_Rdot));     % Σ log(2πσ_Rdot²)
-
-% DEBUG: Check penalty components
-fprintf('  n_total_data: %d\n', n_total_data);
-fprintf('  max_R: %.6e, med_var_R: %.6e, ratio: %.6e\n', max_R, med_var_R, max_R^2/med_var_R);
-fprintf('  max_Rdot: %.6e, med_var_Rdot: %.6e, ratio: %.6e\n', max_Rdot, med_var_Rdot, max_Rdot^2/med_var_Rdot);
-
-% DEBUG: Check sigma0 values
-fprintf('DEBUG sigma0 stats:\n');
-fprintf('  sigma0_R:    min=%.6e, max=%.6e, median=%.6e\n', ...
-    min(sigma0_R(mask)), max(sigma0_R(mask)), median(sigma0_R(mask)));
-fprintf('  sigma0_Rdot: min=%.6e, max=%.6e, median=%.6e\n', ...
-    min(sigma0_Rdot(mask)), max(sigma0_Rdot(mask)), median(sigma0_Rdot(mask)));
-fprintf('  weights_w:   min=%.6e, max=%.6e, median=%.6e\n', ...
-    min(weights_w(mask)), max(weights_w(mask)), median(weights_w(mask)));
-fprintf('  Penalty NLL for failures: %.6e\n\n', penalty_nll);
-
+fprintf('penalty_nll = %.4e\n', penalty_nll);
 % PARALLEL LOOP over theta
 parfor i = 1:N
     theta = theta_matrix(i,:);
@@ -173,9 +158,9 @@ parfor i = 1:N
     NLL_beta(i, :) = nll_row;
 end
 
-if N <= 20 && N_beta == 1
-    fprintf('NLL range: [%.2e, %.2e]\n\n', min(NLL_beta(:)), max(NLL_beta(:)));
-end
+% if N <= 20 && N_beta == 1
+%     fprintf('NLL range: [%.2e, %.2e]\n\n', min(NLL_beta(:)), max(NLL_beta(:)));
+% end
 
 end
 

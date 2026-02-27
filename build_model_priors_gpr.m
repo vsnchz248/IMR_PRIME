@@ -139,9 +139,9 @@ assert(used>0,'No valid trials after gating.');
 normA = sqrt(A2/used);   % ||A*||_w (data-driven)
 normB = sqrt(B2/used);   % ||B||_w (data-driven)
 
-if ~opts.quiet
-    fprintf('  Kernel norms: ||A*|| = %.4e, ||B|| = %.4e\n', normA, normB);
-end
+% if ~opts.quiet
+%     fprintf('  Kernel norms: ||A*|| = %.4e, ||B|| = %.4e\n', normA, normB);
+% end
 
 % Maxwell kernel norm handle
 maxwell_norm = @(De) maxwell_L2_norm_over_trials(De, Acell, Tcell, Wcell);
@@ -271,10 +271,10 @@ else
 end
 nl_need = max(0, min(1, nl_need));
 
-if ~opts.quiet
-    fprintf('  Axis needs: elastic=%.3f, maxwell=%.3f, nonlinear=%.3f\n', ...
-            e_need, m_need, nl_need);
-end
+% if ~opts.quiet
+%     fprintf('  Axis needs: elastic=%.3f, maxwell=%.3f, nonlinear=%.3f\n', ...
+%             e_need, m_need, nl_need);
+% end
 
 %% ---------------- Harmonic-mean scores ----------------
 score.Newt = ones(size(grid.Newt.mu));
@@ -304,9 +304,9 @@ for k = 1:numel(models)
 end
 
 %% ---------------- Add continuous prior functions ----------------
-if ~opts.quiet
-    fprintf('Creating continuous prior evaluators...\n');
-end
+% if ~opts.quiet
+%     fprintf('Creating continuous prior evaluators...\n');
+% end
 
 for k = 1:numel(models)
     M = models{k};
@@ -315,9 +315,9 @@ end
 
 %% ---------------- Pre-compute redundancy GPRs (Option A) ----------------
 if opts.precompute_redundancy
-    if ~opts.quiet
-        fprintf('\nPre-computing redundancy GPRs (this may take 5-10 min)...\n');
-    end
+    % if ~opts.quiet
+    %     fprintf('\nPre-computing redundancy GPRs (this may take 5-10 min)...\n');
+    % end
     
     % Generate representative meanframe
     meanframe = generate_meanframe(expData);
@@ -326,9 +326,9 @@ if opts.precompute_redundancy
         M = models{k};
         
         tic;
-        if ~opts.quiet
-            fprintf('  [%d/%d] %s...', k, numel(models), M);
-        end
+        % if ~opts.quiet
+        %     fprintf('  [%d/%d] %s...', k, numel(models), M);
+        % end
         
         % Train redundancy GPR
         wred_gpr = train_redundancy_gpr(M, priors, meanframe, ...
@@ -338,14 +338,14 @@ if opts.precompute_redundancy
         % Update prior function to include redundancy
         priors.(M).prior_fn = @(theta) evaluate_full_prior(theta, M, priors, expData);
         
-        if ~opts.quiet
-            fprintf(' done (%.1f s)\n', toc);
-        end
+        % if ~opts.quiet
+        %     fprintf(' done (%.1f s)\n', toc);
+        % end
     end
     
-    if ~opts.quiet
-        fprintf('\n Redundancy GPRs trained for all models\n\n');
-    end
+    % if ~opts.quiet
+    %     fprintf('\n Redundancy GPRs trained for all models\n\n');
+    % end
 end
 
 end
@@ -392,13 +392,15 @@ if isfield(priors.(modelKey), 'wred_gpr')
         end
     else
         % Real GPR - predict
-        log_wred = predict(gpr_obj, theta);
+        log_wred = min(0,predict(gpr_obj, theta));
     end
 else
     log_wred = 0;
 end
 
-logP = logP_harm + log_wred;
+% Scale redundancy by N_eff so it competes with likelihood
+N_eff = 2 * nnz(expData.mask);
+logP = logP_harm + N_eff * log_wred;
 
 end
 
@@ -524,7 +526,7 @@ for i = 1:N_samples
         modelKey, theta_samples(i,:), meanframe, priors, expData);
 end
 
-log_wred = log(max(wred_samples, 1e-12));
+log_wred = min(0,log(max(wred_samples, 1e-12)));
 
 % Check for constant redundancy (happens for some models)
 if std(log_wred) < 1e-6
@@ -589,20 +591,20 @@ for s = 1:numel(subsets)
         continue;
     end
     
-    c_best = (S_sub' * S_parent) / max(sum(S_sub.^2), eps);
-    residual = S_parent - c_best * S_sub;
-    rel_err = norm(residual, 2) / norm_parent;
+    residual = S_parent - S_sub;
+    % Threshold = noise-to-signal ratio from data
+    sigma_ref = sqrt(median(expData.sigma0_R(expData.mask).^2));
+    signal_ref = norm(S_parent, 2) / sqrt(numel(S_parent));
+    tau_local = sigma_ref / max(signal_ref, eps);
+    tau_local = max(1e-6, min(0.5, tau_local));  % safety bounds
     
-    tau_local = 0.01;
+    rel_err = norm(residual, 2) / norm_parent;
     f_subset(s) = rel_err^2 / (rel_err^2 + tau_local^2);
     f_subset(s) = max(1e-12, min(1, f_subset(s)));
 end
 
 w_red = min(f_subset);
 w_red = max(1e-12, min(1, w_red));
-
-N_eff = 2 * nnz(expData.mask);
-w_red = w_red^N_eff;
 
 end
 
